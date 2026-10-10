@@ -346,11 +346,11 @@ def seed():
                     option_d=op_d,
                     correct_option=corr,
                     subject=subj,
-                    difficulty=QuestionDifficulty.INTERMEDIATE,
-                    school_category="Senior Secondary",
-                    mode="Standard",
-                    question_type="Multiple Choice",
-                    points=100,
+                    difficulty=QuestionDifficulty.SECONDARY,
+                    school_category=SchoolCategory.SENIOR_SECONDARY,
+                    question_mode="Standard",
+                    stage="Group Stage 2",
+                    is_active=True,
                     tournament_track_id=main_track.id if main_track else 1
                 )
                 db.add(new_q)
@@ -382,11 +382,11 @@ def seed():
                         option_d=options[3],
                         correct_option=corr_letter,
                         subject="Spelling",
-                        difficulty=QuestionDifficulty.INTERMEDIATE,
-                        school_category="Senior Secondary",
-                        mode="Standard",
-                        question_type="Multiple Choice",
-                        points=100,
+                        difficulty=QuestionDifficulty.SECONDARY,
+                        school_category=SchoolCategory.SENIOR_SECONDARY,
+                        question_mode="Standard",
+                        stage="Group Stage 2",
+                        is_active=True,
                         tournament_track_id=spell_track.id
                     )
                     db.add(sp_q)
