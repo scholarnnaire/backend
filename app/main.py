@@ -15,9 +15,28 @@ Base.metadata.create_all(bind=engine)
 
 app = FastAPI(title=settings.PROJECT_NAME)
 
+allowed_origins = [
+    "http://scholarnnaire.com",
+    "https://scholarnnaire.com",
+    "http://www.scholarnnaire.com",
+    "https://www.scholarnnaire.com",
+    "http://api.scholarnnaire.com",
+    "https://api.scholarnnaire.com",
+    "http://localhost:5173",
+    "http://localhost:3000",
+    "http://127.0.0.1:5173",
+]
+
+if settings.ALLOWED_ORIGINS and settings.ALLOWED_ORIGINS != "*":
+    for origin in settings.ALLOWED_ORIGINS.split(","):
+        orig_clean = origin.strip()
+        if orig_clean and orig_clean not in allowed_origins:
+            allowed_origins.append(orig_clean)
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[settings.ALLOWED_ORIGINS],
+    allow_origins=allowed_origins if settings.ALLOWED_ORIGINS != "*" else ["*"],
+    allow_origin_regex=r"https?://(.*\.)?scholarnnaire\.com(:\d+)?",
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
