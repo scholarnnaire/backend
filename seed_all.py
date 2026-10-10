@@ -15,9 +15,11 @@ from app.models.school import (
 )
 from app.models.question import Question, QuestionDifficulty
 from app.models.competition import Certificate, Notification
-from passlib.context import CryptContext
+import bcrypt
 
-pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
+def get_password_hash(password: str) -> str:
+    pwd_bytes = password.encode('utf-8')[:72]
+    return bcrypt.hashpw(pwd_bytes, bcrypt.gensalt()).decode('utf-8')
 
 def seed():
     print("=" * 60)
@@ -95,8 +97,8 @@ def seed():
                 contact_email="admin@ststeve.edu.ng",
                 contact_phone="08012345678",
                 admin_username="ststeve",
-                password_hash=pwd_context.hash("password123"),
-                access_code="SCH-STSTEVE-2026",
+                password_hash=get_password_hash("password123"),
+                access_code=None,
                 is_approved=True,
                 entry_fee_paid=True,
                 tournament_track="Main Scholarnnaire Quiz"
@@ -104,6 +106,12 @@ def seed():
             db.add(school)
             db.flush()
             print("✓ Created School: St Steve Secondary (User: ststeve, Pass: password123)")
+        else:
+            school.admin_username = "ststeve"
+            school.password_hash = get_password_hash("password123")
+            school.access_code = None
+            db.flush()
+            print("✓ Updated School Credentials: User: ststeve, Pass: password123")
 
         # ── 5. SEED TEAM: VISIONARIES ──
         team = db.query(Team).filter(Team.code == "T0023").first()

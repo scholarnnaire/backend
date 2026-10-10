@@ -15,7 +15,17 @@ from typing import Optional
 
 router = APIRouter()
 email_service = EmailService()
-pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
+import bcrypt
+
+def get_password_hash(password: str) -> str:
+    pwd_bytes = password.encode('utf-8')[:72]
+    return bcrypt.hashpw(pwd_bytes, bcrypt.gensalt()).decode('utf-8')
+
+def verify_password(plain_password: str, hashed_password: str) -> bool:
+    try:
+        return bcrypt.checkpw(plain_password.encode('utf-8')[:72], hashed_password.encode('utf-8'))
+    except Exception:
+        return False
 
 class LoginPayload(BaseModel):
     identifier: str
@@ -55,7 +65,7 @@ def register_school(payload: school_schemas.SchoolCreate, background_tasks: Back
     school_data = payload.model_dump()
     password = school_data.pop("password")
     school_data.update({
-        "password_hash": pwd_context.hash(password),
+        "password_hash": get_password_hash(password),
         "access_code": access_code,
         "is_approved": True,
         "entry_fee_paid": False, 
@@ -100,7 +110,7 @@ def login(payload: LoginPayload, db: Session = Depends(deps.get_db)):
     if not school or not school.password_hash:
         raise HTTPException(status_code=401, detail="Invalid username or password")
         
-    if not pwd_context.verify(payload.password, school.password_hash):
+    if not verify_password(payload.password, school.password_hash):
         raise HTTPException(status_code=401, detail="Invalid username or password")
         
     if school.access_code is not None:
@@ -162,7 +172,7 @@ def reset_password(payload: ResetPasswordRequest, db: Session = Depends(deps.get
     if not school.reset_password_expires or datetime.utcnow() > school.reset_password_expires:
         raise HTTPException(status_code=400, detail="Token has expired")
 
-    school.password_hash = pwd_context.hash(payload.new_password)
+    school.password_hash = get_password_hash(payload.new_password)
     school.reset_password_token = None
     school.reset_password_expires = None
     db.commit()
