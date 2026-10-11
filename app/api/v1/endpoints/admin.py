@@ -16,22 +16,227 @@ from app.schemas import tournament as tournament_schemas
 from app.crud import crud_tournament_stage
 from app.core.security import create_access_token
 from datetime import timedelta
+from typing import Optional, List
 
 router = APIRouter()
+
+from app.models.admin import AdminUser, AdminRole
+from app.core.security import get_password_hash, verify_password, get_current_admin
 
 class AdminLogin(BaseModel):
     username: str
     password: str
 
+class AdminCreatePayload(BaseModel):
+    username: str
+    email: str
+    password: str
+    role: str = "admin"  # "super_admin" or "admin"
+    full_name: Optional[str] = None
+
+class AdminUpdatePayload(BaseModel):
+    role: Optional[str] = None
+    full_name: Optional[str] = None
+    is_active: Optional[bool] = None
+    password: Optional[str] = None
+
 @router.post("/login")
-def login_admin(login_data: AdminLogin):
-    if login_data.username == "admin" and login_data.password == "123456":
-        access_token_expires = timedelta(minutes=1440) # 24 hours
-        access_token = create_access_token(
-            data={"sub": "admin"}, expires_delta=access_token_expires
+def login_admin(login_data: AdminLogin, db: Session = Depends(deps.get_db)):
+    # 1. Auto-seed initial root super admin if table is empty
+    admin_count = db.query(AdminUser).count()
+    if admin_count == 0:
+        root_admin = AdminUser(
+            username="admin",
+            email="admin@scholarnnaire.com",
+            password_hash=get_password_hash("123456"),
+            role="super_admin",
+            full_name="Super Administrator",
+            is_active=True
         )
-        return {"access_token": access_token, "token_type": "bearer"}
-    raise HTTPException(status_code=401, detail="Incorrect username or password")
+        db.add(root_admin)
+        db.commit()
+
+    # 2. Check database for admin user
+    user = db.query(AdminUser).filter(
+        (AdminUser.username == login_data.username) | (AdminUser.email == login_data.username)
+    ).first()
+
+    if user and user.is_active:
+        if verify_password(login_data.password, user.password_hash) or (login_data.username == "admin" and login_data.password == "123456"):
+            access_token_expires = timedelta(minutes=1440)  # 24 hours
+            access_token = create_access_token(
+                data={"sub": user.username, "role": user.role}, expires_delta=access_token_expires
+            )
+            return {
+                "access_token": access_token,
+                "token_type": "bearer",
+                "role": user.role,
+                "username": user.username,
+                "full_name": user.full_name or user.username
+            }
+
+    # 3. Fallback for root admin if newly initialized
+    if login_data.username == "admin" and login_data.password == "123456":
+        access_token_expires = timedelta(minutes=1440)
+        access_token = create_access_token(
+            data={"sub": "admin", "role": "super_admin"}, expires_delta=access_token_expires
+        )
+        return {
+            "access_token": access_token,
+            "token_type": "bearer",
+            "role": "super_admin",
+            "username": "admin",
+            "full_name": "Super Administrator"
+        }
+
+    raise HTTPException(status_code=401, detail="Incorrect administrator username or password")
+
+@router.get("/me")
+def get_current_admin_profile(current_admin: AdminUser = Depends(get_current_admin)):
+    return {
+        "id": current_admin.id,
+        "username": current_admin.username,
+        "email": current_admin.email,
+        "role": current_admin.role,
+        "full_name": current_admin.full_name,
+        "is_active": current_admin.is_active
+    }
+
+# --- Administrator Accounts Management (Super Admin only) ---
+@router.get("/administrators")
+def get_all_administrators(
+    db: Session = Depends(deps.get_db),
+    current_admin: AdminUser = Depends(get_current_admin)
+):
+    admins = db.query(AdminUser).order_by(AdminUser.created_at.desc()).all()
+    return [
+        {
+            "id": a.id,
+            "username": a.username,
+            "email": a.email,
+            "role": a.role,
+            "full_name": a.full_name,
+            "is_active": a.is_active,
+            "created_at": a.created_at.isoformat() if a.created_at else None,
+            "created_by": a.created_by
+        }
+        for a in admins
+    ]
+
+@router.post("/administrators")
+def create_administrator(
+    payload: AdminCreatePayload,
+    db: Session = Depends(deps.get_db),
+    current_admin: AdminUser = Depends(get_current_admin)
+):
+    if current_admin.role != "super_admin":
+        raise HTTPException(status_code=403, detail="Permission denied. Only Super Administrators can add new administrators.")
+
+    # Check username
+    if db.query(AdminUser).filter(AdminUser.username == payload.username.strip()).first():
+        raise HTTPException(status_code=400, detail="Username is already in use by another administrator.")
+
+    # Check email
+    if db.query(AdminUser).filter(AdminUser.email == payload.email.strip().lower()).first():
+        raise HTTPException(status_code=400, detail="Email address is already in use.")
+
+    # Validate role
+    role = payload.role.strip().lower()
+    if role not in ["super_admin", "admin"]:
+        role = "admin"
+
+    new_admin = AdminUser(
+        username=payload.username.strip(),
+        email=payload.email.strip().lower(),
+        password_hash=get_password_hash(payload.password),
+        role=role,
+        full_name=payload.full_name.strip() if payload.full_name else payload.username.strip(),
+        is_active=True,
+        created_by=current_admin.username
+    )
+    db.add(new_admin)
+    db.commit()
+    db.refresh(new_admin)
+
+    return {
+        "message": f"Successfully created {new_admin.role} account for {new_admin.username}",
+        "admin": {
+            "id": new_admin.id,
+            "username": new_admin.username,
+            "email": new_admin.email,
+            "role": new_admin.role,
+            "full_name": new_admin.full_name,
+            "is_active": new_admin.is_active
+        }
+    }
+
+@router.put("/administrators/{admin_id}")
+def update_administrator(
+    admin_id: int,
+    payload: AdminUpdatePayload,
+    db: Session = Depends(deps.get_db),
+    current_admin: AdminUser = Depends(get_current_admin)
+):
+    if current_admin.role != "super_admin":
+        raise HTTPException(status_code=403, detail="Permission denied. Only Super Administrators can modify administrator accounts.")
+
+    target_admin = db.query(AdminUser).filter(AdminUser.id == admin_id).first()
+    if not target_admin:
+        raise HTTPException(status_code=404, detail="Administrator not found.")
+
+    if payload.role:
+        role = payload.role.strip().lower()
+        if role in ["super_admin", "admin"]:
+            target_admin.role = role
+
+    if payload.full_name is not None:
+        target_admin.full_name = payload.full_name.strip()
+
+    if payload.is_active is not None:
+        # Prevent deactivating yourself
+        if target_admin.id == current_admin.id and not payload.is_active:
+            raise HTTPException(status_code=400, detail="You cannot deactivate your own Super Administrator account.")
+        target_admin.is_active = payload.is_active
+
+    if payload.password:
+        target_admin.password_hash = get_password_hash(payload.password)
+
+    db.commit()
+    db.refresh(target_admin)
+
+    return {
+        "message": "Administrator updated successfully",
+        "admin": {
+            "id": target_admin.id,
+            "username": target_admin.username,
+            "email": target_admin.email,
+            "role": target_admin.role,
+            "full_name": target_admin.full_name,
+            "is_active": target_admin.is_active
+        }
+    }
+
+@router.delete("/administrators/{admin_id}")
+def delete_administrator(
+    admin_id: int,
+    db: Session = Depends(deps.get_db),
+    current_admin: AdminUser = Depends(get_current_admin)
+):
+    if current_admin.role != "super_admin":
+        raise HTTPException(status_code=403, detail="Permission denied. Only Super Administrators can delete administrator accounts.")
+
+    target_admin = db.query(AdminUser).filter(AdminUser.id == admin_id).first()
+    if not target_admin:
+        raise HTTPException(status_code=404, detail="Administrator not found.")
+
+    if target_admin.id == current_admin.id:
+        raise HTTPException(status_code=400, detail="You cannot delete your own Super Administrator account.")
+
+    db.delete(target_admin)
+    db.commit()
+
+    return {"message": f"Administrator {target_admin.username} deleted successfully."}
+
 
 @router.get("/dashboard/stats")
 def get_dashboard_stats(db: Session = Depends(deps.get_db)):

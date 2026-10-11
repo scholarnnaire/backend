@@ -653,3 +653,58 @@ def submit_match_answers(
     
     return {"message": "Answers submitted successfully", "score": score}
 
+@router.get("/practice/summary")
+def get_practice_summary(db: Session = Depends(deps.get_db)):
+    from app.models.question import Question
+    subjects_map = {
+        "math": ["Mathematics", "Maths", "Math"],
+        "eng": ["English Language", "English"],
+        "sci": ["General Science", "Basic Science", "Science", "Biology", "Physics", "Chemistry"],
+        "soc": ["Current Affairs", "Social Studies", "General"]
+    }
+    counts = {}
+    for key, aliases in subjects_map.items():
+        conditions = [Question.subject.ilike(f"%{a}%") for a in aliases]
+        count = db.query(Question).filter(Question.is_active == True, or_(*conditions)).count()
+        counts[key] = count
+    return counts
+
+@router.get("/practice/questions")
+def get_practice_questions(
+    subject: Optional[str] = None,
+    limit: int = 10,
+    db: Session = Depends(deps.get_db)
+):
+    import random
+    from app.models.question import Question
+    query = db.query(Question).filter(Question.is_active == True)
+    
+    if subject and subject.lower() != 'all':
+        query = query.filter(Question.subject.ilike(f"%{subject}%"))
+    
+    questions = query.all()
+    if not questions:
+        questions = db.query(Question).filter(Question.is_active == True).all()
+        
+    if len(questions) > limit:
+        questions = random.sample(questions, limit)
+    elif questions:
+        random.shuffle(questions)
+        
+    return [
+        {
+            "id": q.id,
+            "text": q.text,
+            "option_a": q.option_a,
+            "option_b": q.option_b,
+            "option_c": q.option_c,
+            "option_d": q.option_d,
+            "correct_option": q.correct_option.strip().upper(),
+            "subject": q.subject,
+            "difficulty": q.difficulty.value if hasattr(q.difficulty, 'value') else str(q.difficulty),
+            "school_category": q.school_category.value if hasattr(q.school_category, 'value') else str(q.school_category),
+        }
+        for q in questions
+    ]
+
+
