@@ -1,6 +1,9 @@
+import os
 import sys
 import random
-sys.path.insert(0, '/Users/rotimiolaosebikan/projects/php/quiz_cart/backend')
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+if BASE_DIR not in sys.path:
+    sys.path.insert(0, BASE_DIR)
 from app.core.database import SessionLocal
 from app.models.school import TournamentTrack
 from app.models.question import Question
