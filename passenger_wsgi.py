@@ -6,6 +6,16 @@ app_dir = os.path.dirname(os.path.abspath(__file__))
 if app_dir not in sys.path:
     sys.path.insert(0, app_dir)
 
+# Auto-install python-multipart if missing in the environment
+try:
+    import multipart  # python-multipart package installs as 'multipart'
+except ImportError:
+    try:
+        import subprocess
+        subprocess.check_call([sys.executable, "-m", "pip", "install", "python-multipart"])
+    except Exception:
+        pass
+
 try:
     from a2wsgi import ASGIMiddleware
     from app.main import app

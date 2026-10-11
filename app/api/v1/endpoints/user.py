@@ -74,7 +74,7 @@ def register_school(payload: school_schemas.SchoolCreate, background_tasks: Back
     
     db_school = crud_school.create_school(db, school_data)
     
-    background_tasks.add_task(email_service.send_registration_email, payload.contact_email, access_code, payload.name)
+    background_tasks.add_task(email_service.send_verification_email, payload.contact_email, access_code, payload.name)
     
     return {
         "school": db_school,
@@ -86,13 +86,22 @@ class VerifyPayload(BaseModel):
     token: str
 
 @router.post("/verify-email", response_model=school_schemas.SchoolAuthResponse)
-def verify_email(payload: VerifyPayload, db: Session = Depends(deps.get_db)):
+def verify_email(payload: VerifyPayload, background_tasks: BackgroundTasks, db: Session = Depends(deps.get_db)):
     school = db.query(School).filter(School.access_code == payload.token).first()
     if not school:
         raise HTTPException(status_code=400, detail="Invalid verification code")
         
     school.access_code = None
     db.commit()
+    
+    # Send post-verification onboarding email with administration instructions and credentials
+    if school.contact_email:
+        background_tasks.add_task(
+            email_service.send_school_onboarding_email,
+            school.contact_email,
+            school.name,
+            school.admin_username or ""
+        )
     
     access_token = create_access_token(data={"sub": str(school.id)})
     return {
