@@ -7,7 +7,7 @@ BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 if BASE_DIR not in sys.path:
     sys.path.insert(0, BASE_DIR)
 
-from app.core.database import SessionLocal, engine, Base
+from app.core.database import SessionLocal, engine, Base, ensure_schema
 import app.models
 from app.models.school import (
     TournamentTrack, Tournament, TournamentStage,
@@ -28,6 +28,7 @@ def seed():
 
     # 1. Create tables if not already present
     Base.metadata.create_all(bind=engine)
+    ensure_schema()
     print("✓ Verified all 21 database tables.")
 
     db = SessionLocal()

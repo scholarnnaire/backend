@@ -5,13 +5,14 @@ from fastapi.staticfiles import StaticFiles
 import os
 
 from app.core.config import settings
-from app.core.database import engine, Base
+from app.core.database import engine, Base, ensure_schema
 from app.core.websockets import manager as connection_manager
 from app.services.game_engine import global_game
 from app.api.v1.api import api_router
 
-# Create tables
+# Create tables and ensure schema
 Base.metadata.create_all(bind=engine)
+ensure_schema()
 
 app = FastAPI(title=settings.PROJECT_NAME)
 
