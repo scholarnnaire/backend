@@ -43,15 +43,15 @@ class ArenaMatch:
         self.timer_frozen: bool = False
         self.questions_frozen: bool = False
         self.buzzers_paused: bool = False
-        self.locked_team: Optional[str] = "Team Alpha"
+        self.locked_team: Optional[str] = "Team Alpha" if match_id == 99999 else None
         self.answer_revealed: bool = False
         self.show_timer_start: float = time.time() - 1725  # ~00:28:45
         self.frozen_time_remaining: int = 15
         self.substitution_status: str = "none" # none, requested, active, confirmed
         self.substitution_details: Optional[dict] = None
         self.pause_reason: Optional[str] = None
-        self.ladder: Dict[int, int] = {1: 7, 2: 3, 3: -1, 4: -3}
-        self.team_scores: Dict[int, float] = {1: 2800, 2: 1200, 3: -400, 4: -1200}
+        self.ladder: Dict[int, int] = {1: 7, 2: 3, 3: -1, 4: -3} if match_id == 99999 else {}
+        self.team_scores: Dict[int, float] = {1: 2800, 2: 1200, 3: -400, 4: -1200} if match_id == 99999 else {}
         self.custom_participants: List[dict] = [
             {
                 "participant_id": 101, "team_id": 1, "team_name": "Team Alpha",
@@ -186,8 +186,7 @@ class ArenaMatch:
             "is_paused": self.phase == "substitution_paused",
             "timers_frozen": self.timer_frozen,
             "questions_frozen": self.questions_frozen,
-            "buzzers_paused": self.buzzers_paused,
-            "locked_team": self.locked_team or ("Team Alpha" if self.locked_answers else None),
+            "locked_team": self.locked_team or (("Team Alpha" if self.match_id == 99999 else None) if self.locked_answers else None),
             "answer_revealed": self.answer_revealed,
             "substitution_status": self.substitution_status,
             "substitution_details": self.substitution_details,

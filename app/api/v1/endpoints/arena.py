@@ -1,9 +1,9 @@
-from typing import Optional
-from fastapi import APIRouter, Depends, HTTPException, Query
-from sqlalchemy.orm import Session
+from typing import Optional, List, Dict, Any
+from fastapi import APIRouter, Depends, HTTPException, Query, Header
+from sqlalchemy.orm import Session, joinedload
 from app.api import deps
 from app.core.security import decode_access_token, get_current_school
-from app.models.school import School, Team, MatchParticipant, TournamentMatch
+from app.models.school import School, Team, MatchParticipant, TournamentMatch, Tournament, TournamentStage, TeamMember
 from app.api.v1.websockets.match_manager import arena_controller
 
 router = APIRouter()
@@ -555,6 +555,410 @@ async def simulate_question_result(match_id: int, req: QuestionResultBody, db: S
         "new_rung": match_manager.ladder.get(req.team_id)
     }
 
+# Scholarnnaire Dual-Ladder Positive Titles & Palettes
+POSITIVE_RUNG_LABELS = {
+    11: "SCHOLARNAIRE",
+    10: "PROFESSOR",
+    9: "ASSOCIATE PROFESSOR",
+    8: "Ph.D",
+    7: "DON",
+    6: "MASTERS",
+    5: "TERTIARY",
+    4: "SECONDARY",
+    3: "PRIMARY",
+    2: "KINDERGARTEN",
+    1: "NURSERY",
+    0: "GROUND LEVEL"
+}
 
+TEAM_PALETTES = [
+    {
+        "color": "from-emerald-500 to-teal-700",
+        "border": "border-emerald-400",
+        "bgLight": "bg-emerald-500/10",
+        "textColor": "text-emerald-400"
+    },
+    {
+        "color": "from-blue-600 to-indigo-800",
+        "border": "border-blue-400",
+        "bgLight": "bg-blue-500/10",
+        "textColor": "text-blue-400"
+    },
+    {
+        "color": "from-amber-500 to-orange-700",
+        "border": "border-amber-400",
+        "bgLight": "bg-amber-500/10",
+        "textColor": "text-amber-400"
+    },
+    {
+        "color": "from-purple-600 to-indigo-900",
+        "border": "border-purple-400",
+        "bgLight": "bg-purple-500/10",
+        "textColor": "text-purple-400"
+    },
+    {
+        "color": "from-rose-500 to-red-700",
+        "border": "border-rose-400",
+        "bgLight": "bg-rose-500/10",
+        "textColor": "text-rose-400"
+    },
+    {
+        "color": "from-cyan-500 to-blue-700",
+        "border": "border-cyan-400",
+        "bgLight": "bg-cyan-500/10",
+        "textColor": "text-cyan-400"
+    }
+]
 
+def format_rung_and_status(score: float):
+    rung = int(score // 400)
+    rung = max(-11, min(11, rung))
+    if rung > 0:
+        title = POSITIVE_RUNG_LABELS.get(rung, f"Rung +{rung}")
+        label = f"+{int(score):,} pts"
+        note = f"{title} (+{int(score):,} pts)"
+        status = "up"
+    elif rung < 0:
+        title = f"{rung} STEP" if abs(rung) == 1 else f"{rung} STEPS"
+        label = f"{int(score):,} pts"
+        note = f"Penalty Step {rung} ({int(score):,} pts)"
+        status = "down"
+    else:
+        title = "GROUND LEVEL"
+        label = "0 pts"
+        note = "Baseline Ground Level (0 pts)"
+        status = "neutral"
+    return rung, title, label, note, status
 
+@router.get("/ladderboard/live")
+async def get_live_ladderboard(
+    tournament_id: Optional[int] = Query(None),
+    match_id: Optional[int] = Query(None),
+    db: Session = Depends(deps.get_db),
+    authorization: Optional[str] = Header(None)
+):
+    """
+    Live Ladderboard API for School Admins, Contestants, and Scholarnnaire Admins.
+    Supplies live dual-ladder standings (+/- rungs), current live show question,
+    and highlights the viewer's own team.
+    """
+    current_school_id = None
+    current_team_id = None
+
+    if authorization and authorization.startswith("Bearer "):
+        token = authorization.split(" ")[1]
+        payload = decode_access_token(token)
+        if payload:
+            if payload.get("sub"):
+                try:
+                    current_school_id = int(payload["sub"])
+                except Exception:
+                    pass
+            if payload.get("team_id"):
+                try:
+                    current_team_id = int(payload["team_id"])
+                except Exception:
+                    pass
+            elif payload.get("participant_id"):
+                m = db.query(TeamMember).filter(TeamMember.participant_id == str(payload["participant_id"])).first()
+                if m:
+                    current_team_id = m.team_id
+                    if m.team and m.team.school_id:
+                        current_school_id = m.team.school_id
+
+    if current_school_id and not current_team_id:
+        user_team = db.query(Team).filter(Team.school_id == current_school_id).first()
+        if user_team:
+            current_team_id = user_team.id
+
+    # 1. Competitions List for Dropdown
+    competitions_list = []
+    tournaments = db.query(Tournament).filter(Tournament.is_active == True).all()
+    for t in tournaments:
+        competitions_list.append({
+            "key": f"tournament_{t.id}",
+            "type": "tournament",
+            "id": t.id,
+            "name": t.name,
+            "category": "Tournament",
+            "status": t.status or "active"
+        })
+
+    matches = db.query(TournamentMatch).options(
+        joinedload(TournamentMatch.stage).joinedload(TournamentStage.tournament)
+    ).all()
+    for m in matches:
+        t_name = m.stage.tournament.name if (m.stage and m.stage.tournament) else "National Tournament"
+        competitions_list.append({
+            "key": f"match_{m.id}",
+            "type": "match",
+            "id": m.id,
+            "name": f"{m.name or f'Match #{m.id}'} • {t_name}",
+            "category": "Live Match",
+            "status": m.status
+        })
+
+    competitions_list.append({
+        "key": "match_99999",
+        "type": "sandbox",
+        "id": 99999,
+        "name": "Scholarnnaire Arena (Sandbox Simulator)",
+        "category": "Simulation",
+        "status": "active"
+    })
+
+    # 2. Determine target competition
+    target_match_id = match_id
+    target_tournament_id = tournament_id
+
+    if target_match_id is None and target_tournament_id is None:
+        if current_team_id:
+            p = db.query(MatchParticipant).filter(MatchParticipant.team_id == current_team_id).first()
+            if p:
+                target_match_id = p.match_id
+            else:
+                user_t = db.query(Team).filter(Team.id == current_team_id).first()
+                if user_t and user_t.tournament_id:
+                    target_tournament_id = user_t.tournament_id
+
+        if target_match_id is None and target_tournament_id is None:
+            active_m = db.query(TournamentMatch).filter(TournamentMatch.status == "active").first()
+            if active_m:
+                target_match_id = active_m.id
+            elif tournaments:
+                act_t = next((t for t in tournaments if t.status == "active"), tournaments[0])
+                target_tournament_id = act_t.id
+            elif matches:
+                target_match_id = matches[0].id
+            else:
+                target_match_id = 99999
+
+    standings = []
+    selected_comp = {}
+    active_match_manager = None
+
+    if target_match_id == 99999:
+        selected_comp = {
+            "type": "sandbox",
+            "id": 99999,
+            "key": "match_99999",
+            "name": "Scholarnnaire Arena (Sandbox Simulator)",
+            "stage_name": "Grand Finals Stage",
+            "tournament_name": "Scholarnnaire National Championship (Sandbox Test)",
+            "status": "active"
+        }
+        active_match_manager = arena_controller.get_match(99999)
+        if len(active_match_manager.questions) == 0:
+            active_match_manager._load_test_questions(db)
+
+        for idx, p in enumerate(active_match_manager.custom_participants):
+            t_id = p["team_id"]
+            sc = active_match_manager.team_scores.get(t_id, p.get("score", 0.0))
+            rung, title, label, note, status = format_rung_and_status(sc)
+            palette = TEAM_PALETTES[idx % len(TEAM_PALETTES)]
+            standings.append({
+                "id": t_id,
+                "team_id": t_id,
+                "name": p["team_name"],
+                "school_name": p.get("school_name", f"Academy #{t_id}"),
+                "score": sc,
+                "rung": rung,
+                "rung_title": title,
+                "rung_label": label,
+                "status": status,
+                "statusNote": note,
+                "color": palette["color"],
+                "border": palette["border"],
+                "bgLight": palette["bgLight"],
+                "textColor": palette["textColor"],
+                "avatar": p["team_name"][0] if p["team_name"] else "T",
+                "is_my_team": (current_team_id == t_id),
+                "members": p.get("members", [])
+            })
+    elif target_match_id is not None:
+        m = db.query(TournamentMatch).options(
+            joinedload(TournamentMatch.stage).joinedload(TournamentStage.tournament),
+            joinedload(TournamentMatch.participants).joinedload(MatchParticipant.team).joinedload(Team.school),
+            joinedload(TournamentMatch.participants).joinedload(MatchParticipant.team).joinedload(Team.members)
+        ).filter(TournamentMatch.id == target_match_id).first()
+
+        if m:
+            t_name = m.stage.tournament.name if (m.stage and m.stage.tournament) else "Scholarnnaire Tournament"
+            selected_comp = {
+                "type": "match",
+                "id": m.id,
+                "key": f"match_{m.id}",
+                "name": m.name or f"Match #{m.id}",
+                "stage_name": m.stage.name if m.stage else "Group Stage",
+                "tournament_name": t_name,
+                "status": m.status
+            }
+            active_match_manager = arena_controller.get_match(m.id)
+            if len(active_match_manager.questions) == 0:
+                await active_match_manager.initialize_questions(db, m.id)
+
+            for idx, p in enumerate(m.participants):
+                team = p.team
+                if not team:
+                    continue
+                sc = active_match_manager.team_scores.get(team.id, p.score if p.score is not None else 0.0)
+                active_match_manager.team_scores[team.id] = sc
+                rung, title, label, note, status = format_rung_and_status(sc)
+                active_match_manager.ladder[team.id] = rung
+
+                palette = TEAM_PALETTES[idx % len(TEAM_PALETTES)]
+                members_list = []
+                if team.members:
+                    members_list = [{"id": mem.id, "name": mem.name, "role": mem.role, "is_captain": mem.is_captain} for mem in team.members]
+
+                standings.append({
+                    "id": team.id,
+                    "team_id": team.id,
+                    "name": team.name,
+                    "school_name": team.school.name if team.school else team.name,
+                    "score": sc,
+                    "rung": rung,
+                    "rung_title": title,
+                    "rung_label": label,
+                    "status": status,
+                    "statusNote": note,
+                    "color": palette["color"],
+                    "border": palette["border"],
+                    "bgLight": palette["bgLight"],
+                    "textColor": palette["textColor"],
+                    "avatar": team.name[0] if team.name else "T",
+                    "is_my_team": (current_team_id == team.id or (current_school_id and team.school_id == current_school_id)),
+                    "members": members_list
+                })
+    else:
+        t = db.query(Tournament).filter(Tournament.id == target_tournament_id).first()
+        if t:
+            selected_comp = {
+                "type": "tournament",
+                "id": t.id,
+                "key": f"tournament_{t.id}",
+                "name": t.name,
+                "stage_name": "All Stages",
+                "tournament_name": t.name,
+                "status": t.status or "active"
+            }
+            teams_in_t = db.query(Team).options(
+                joinedload(Team.school),
+                joinedload(Team.members)
+            ).filter(Team.tournament_id == t.id).all()
+
+            if len(teams_in_t) < 4:
+                all_teams = db.query(Team).options(
+                    joinedload(Team.school),
+                    joinedload(Team.members)
+                ).all()
+                existing_ids = {tm.id for tm in teams_in_t}
+                for tm in all_teams:
+                    if tm.id not in existing_ids:
+                        teams_in_t.append(tm)
+
+            active_m = db.query(TournamentMatch).join(TournamentStage).filter(
+                TournamentStage.tournament_id == t.id,
+                TournamentMatch.status == "active"
+            ).first()
+            if active_m:
+                active_match_manager = arena_controller.get_match(active_m.id)
+                if len(active_match_manager.questions) == 0:
+                    await active_match_manager.initialize_questions(db, active_m.id)
+            else:
+                t_matches = db.query(TournamentMatch).join(TournamentStage).filter(
+                    TournamentStage.tournament_id == t.id
+                ).all()
+                for tm in t_matches:
+                    if tm.id in arena_controller.matches:
+                        active_match_manager = arena_controller.matches[tm.id]
+                        break
+                if not active_match_manager and t_matches:
+                    active_match_manager = arena_controller.get_match(t_matches[0].id)
+                    if len(active_match_manager.questions) == 0:
+                        await active_match_manager.initialize_questions(db, t_matches[0].id)
+                elif not active_match_manager:
+                    if 99999 in arena_controller.matches:
+                        active_match_manager = arena_controller.matches[99999]
+
+            for idx, team in enumerate(teams_in_t):
+                sc = 0.0
+                if active_match_manager and team.id in active_match_manager.team_scores:
+                    sc = active_match_manager.team_scores[team.id]
+                else:
+                    parts = db.query(MatchParticipant).filter(MatchParticipant.team_id == team.id).all()
+                    if parts:
+                        sc = sum(p.score for p in parts if p.score)
+                    elif team.members:
+                        sc = float(sum(m.score for m in team.members if m.score))
+
+                rung, title, label, note, status = format_rung_and_status(sc)
+                palette = TEAM_PALETTES[idx % len(TEAM_PALETTES)]
+                members_list = [{"id": mem.id, "name": mem.name, "role": mem.role, "is_captain": mem.is_captain} for mem in (team.members or [])]
+
+                standings.append({
+                    "id": team.id,
+                    "team_id": team.id,
+                    "name": team.name,
+                    "school_name": team.school.name if team.school else team.name,
+                    "score": sc,
+                    "rung": rung,
+                    "rung_title": title,
+                    "rung_label": label,
+                    "status": status,
+                    "statusNote": note,
+                    "color": palette["color"],
+                    "border": palette["border"],
+                    "bgLight": palette["bgLight"],
+                    "textColor": palette["textColor"],
+                    "avatar": team.name[0] if team.name else "T",
+                    "is_my_team": (current_team_id == team.id or (current_school_id and team.school_id == current_school_id)),
+                    "members": members_list
+                })
+
+    # Sort descending by score
+    standings.sort(key=lambda x: x["score"], reverse=True)
+    for idx, item in enumerate(standings):
+        item["currentRank"] = idx + 1
+        item["prevRank"] = idx + 1
+        item["rank"] = idx + 1
+
+    my_team = next((s for s in standings if s["is_my_team"]), None)
+
+    # 3. Live Show Active Question
+    live_show = None
+    if active_match_manager and active_match_manager.questions:
+        pub = active_match_manager.get_public_state()
+        curr_q = pub.get("current_question")
+        if curr_q:
+            l_team_str = pub.get("locked_team")
+            if not l_team_str and active_match_manager.locked_answers:
+                first_locked_id = list(active_match_manager.locked_answers.keys())[0]
+                t_match = next((s for s in standings if s["team_id"] == first_locked_id), None)
+                l_team_str = t_match["name"] if t_match else f"Team {first_locked_id}"
+
+            live_show = {
+                "is_live_now": True,
+                "match_id": active_match_manager.match_id,
+                "phase": pub.get("phase", "question_active"),
+                "game_status": pub.get("game_status", "LIVE SHOW"),
+                "current_question_index": pub.get("current_question_index", 1),
+                "total_questions": pub.get("total_questions", len(active_match_manager.questions)),
+                "current_question": curr_q,
+                "locked_team": l_team_str,
+                "locked_answers": pub.get("locked_answers", []),
+                "time_left": pub.get("time_left", 30),
+                "show_timer_formatted": pub.get("show_timer_formatted", "00:28:45"),
+                "answer_revealed": pub.get("answer_revealed", False),
+                "correct_option": pub.get("correct_option") if pub.get("answer_revealed") else None,
+                "buzzers_paused": pub.get("buzzers_paused", False)
+            }
+
+    return {
+        "status": "success",
+        "selected_competition": selected_comp,
+        "competitions_list": competitions_list,
+        "my_team": my_team,
+        "standings": standings,
+        "live_show": live_show
+    }
