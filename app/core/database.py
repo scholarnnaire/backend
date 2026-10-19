@@ -15,6 +15,7 @@ def ensure_schema():
         with engine.connect() as conn:
             columns_to_check = [
                 ("questions", "tournament_track_id", "INT NULL"),
+                ("questions", "game_division_id", "INT NULL"),
                 ("questions", "question_mode", "VARCHAR(50) NULL"),
                 ("questions", "question_type", "VARCHAR(50) NULL"),
                 ("questions", "stage", "VARCHAR(50) DEFAULT 'Group Stage 1' NULL"),
