@@ -16,6 +16,7 @@ from app.schemas import tournament as tournament_schemas
 from app.crud import crud_tournament_stage
 from app.core.security import create_access_token
 from datetime import timedelta
+import datetime
 from typing import Optional, List
 
 router = APIRouter()
@@ -269,12 +270,18 @@ def get_dashboard_stats(db: Session = Depends(deps.get_db)):
 def read_questions(skip: int = 0, limit: int = 100, db: Session = Depends(deps.get_db)):
     return crud_question.get_questions(db, skip=skip, limit=limit)
 
+@router.post("/questions", response_model=question_schemas.Question)
+def create_question(question: question_schemas.QuestionCreate, db: Session = Depends(deps.get_db)):
+    return crud_question.create_question(db, question)
+
 @router.post("/questions/upload", response_model=list[question_schemas.Question])
 async def upload_questions(
     file: UploadFile = File(...),
-    tournament_track_id: int = Form(...),
-    question_mode: str = Form(...),
-    question_type: str = Form(...),
+    tournament_track_id: Optional[int] = Form(None),
+    stage: str = Form(default="Group Stage 1"),
+    game_division_id: Optional[int] = Form(None),
+    question_mode: str = Form(default="Standard"),
+    question_type: str = Form(default="Multiple Choice"),
     subject: str = Form(default="General"),
     difficulty: str = Form(default="Primary"),
     school_category: str = Form(default="Primary"),
@@ -302,9 +309,11 @@ async def upload_questions(
                 subject=row.get('subject') or subject,
                 difficulty=row.get('difficulty') or difficulty,
                 school_category=row.get('school_category') or school_category,
-                tournament_track_id=tournament_track_id,
-                question_mode=question_mode,
-                question_type=question_type
+                tournament_track_id=int(row.get('tournament_track_id')) if row.get('tournament_track_id') else tournament_track_id,
+                stage=row.get('stage') or stage,
+                game_division_id=int(row.get('game_division_id')) if row.get('game_division_id') else game_division_id,
+                question_mode=row.get('question_mode') or question_mode,
+                question_type=row.get('question_type') or question_type
             )
             questions_to_create.append(q_data)
         except Exception as e:
@@ -413,15 +422,42 @@ def delete_team(team_id: int, db: Session = Depends(deps.get_db)):
 # --- Events Management ---
 @router.get("/events", response_model=list[event_schemas.MatchEvent])
 def read_events(db: Session = Depends(deps.get_db)):
-    return db.query(MatchEvent).all()
+    from app.db.seed_events import seed_events_if_empty
+    seed_events_if_empty(db)
+    return db.query(MatchEvent).order_by(MatchEvent.date.asc()).all()
 
 @router.post("/events", response_model=event_schemas.MatchEvent)
 def create_event(event: event_schemas.MatchEventCreate, db: Session = Depends(deps.get_db)):
-    db_event = MatchEvent(**event.model_dump())
+    data = event.model_dump()
+    if not data.get("date"):
+        data["date"] = datetime.datetime.utcnow()
+    db_event = MatchEvent(**data)
     db.add(db_event)
     db.commit()
     db.refresh(db_event)
     return db_event
+
+@router.put("/events/{event_id}", response_model=event_schemas.MatchEvent)
+def update_event(event_id: int, event_in: event_schemas.MatchEventUpdate, db: Session = Depends(deps.get_db)):
+    db_event = db.query(MatchEvent).filter(MatchEvent.id == event_id).first()
+    if not db_event:
+        raise HTTPException(status_code=404, detail="Event not found")
+    update_data = event_in.model_dump(exclude_unset=True)
+    for field, val in update_data.items():
+        setattr(db_event, field, val)
+    db.commit()
+    db.refresh(db_event)
+    return db_event
+
+@router.delete("/events/{event_id}")
+def delete_event(event_id: int, db: Session = Depends(deps.get_db)):
+    db_event = db.query(MatchEvent).filter(MatchEvent.id == event_id).first()
+    if not db_event:
+        raise HTTPException(status_code=404, detail="Event not found")
+    db.delete(db_event)
+    db.commit()
+    return {"status": "success", "message": "Event deleted successfully"}
+
 
 # --- Live Matches Management ---
 @router.get("/matches/live")

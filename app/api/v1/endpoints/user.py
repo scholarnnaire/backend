@@ -147,7 +147,7 @@ def forgot_password(payload: ForgotPasswordRequest, db: Session = Depends(deps.g
     db.commit()
 
     # Send email
-    subject = "Password Reset Token - Millionaires on Wheels"
+    subject = "Password Reset Token - Who Wants To be A Scholarnnaire"
     body = f"""
     <html>
       <body>
@@ -162,7 +162,7 @@ def forgot_password(payload: ForgotPasswordRequest, db: Session = Depends(deps.g
             <p>This token will expire in 15 minutes.</p>
             <p>If you did not request this, please ignore this email.</p>
             <br>
-            <p>Best regards,<br>Millionaires on Wheels Team</p>
+            <p>Best regards,<br>Who Wants To be A Scholarnnaire Team</p>
         </div>
       </body>
     </html>
@@ -194,7 +194,6 @@ def get_dashboard_data(school: School = Depends(get_current_school), db: Session
     from sqlalchemy import or_, and_
     from app.models.events import LiveMatch, MatchEvent
     from app.models.school import Team
-    import datetime
 
     # Calculate Tournament Position dynamically
     pos = {
@@ -230,7 +229,7 @@ def get_dashboard_data(school: School = Depends(get_current_school), db: Session
         pos["record"] = f"{wins}W - {losses}L - {draws}D"
         pos["points"] = (wins * 3) + (draws * 1)
         
-        now = datetime.datetime.utcnow()
+        now = datetime.utcnow()
         next_match = db.query(LiveMatch).join(MatchEvent).filter(
             or_(LiveMatch.team1_id == team.id, LiveMatch.team2_id == team.id),
             LiveMatch.status.in_(["Waiting", "Scheduled"]),
@@ -317,8 +316,8 @@ def get_dashboard_data(school: School = Depends(get_current_school), db: Session
         }
     }
 
-@router.get("/events")
-def get_available_events(school: School = Depends(get_current_school), db: Session = Depends(deps.get_db)):
+@router.get("/tournaments")
+def get_available_tournaments(school: School = Depends(get_current_school), db: Session = Depends(deps.get_db)):
     """Return all active tournaments visible to this school (state-scoped + global)."""
     from sqlalchemy import or_
     school_state = school.state
@@ -358,6 +357,511 @@ def get_available_events(school: School = Depends(get_current_school), db: Sessi
         })
 
     return result
+
+def check_event_stage_and_qualification(ev, team):
+    """
+    Enforces tournament progression rules:
+    - Only start or group stage of the competition can be registered for directly.
+    - Advanced stages (Quarter Final, Semi Final, 3rd Place, Final) cannot be registered for directly.
+    - Only teams that have qualified from the start stage or preceding stage can advance.
+    """
+    name_lower = (ev.name or "").lower()
+    stage_lower = (ev.stage or "").lower()
+
+    if "quarter" in name_lower or "quarter" in stage_lower:
+        stage_type = "knockout"
+        required_stage = "Group Stage 2"
+        is_qualified = bool(
+            team and (
+                team.is_qf_qualified or 
+                (team.current_stage and any(s in team.current_stage.lower() for s in ["quarter", "semi", "final"]))
+            )
+        )
+        lock_message = f"Direct registration is closed for {ev.name}. This is an advanced knockout stage; only teams finishing in the qualifying positions of {required_stage} can advance to this round."
+    elif "semi" in name_lower or "semi" in stage_lower:
+        stage_type = "knockout"
+        required_stage = "Quarter-Final"
+        is_qualified = bool(
+            team and team.current_stage and any(s in team.current_stage.lower() for s in ["semi", "final"])
+        )
+        lock_message = f"Direct registration is closed for {ev.name}. Only Quarter-Final winners advance to the Semi-Finals."
+    elif "3rd" in name_lower or "third" in name_lower:
+        stage_type = "knockout"
+        required_stage = "Semi-Final"
+        is_qualified = bool(
+            team and team.current_stage and any(s in team.current_stage.lower() for s in ["3rd", "third", "semi", "final"])
+        )
+        lock_message = f"Direct registration is closed for {ev.name}. Only Semi-Final runners-up advance to the 3rd Place Match."
+    elif "final" in name_lower or "final" in stage_lower or "championship" in name_lower:
+        stage_type = "knockout"
+        required_stage = "Semi-Final"
+        is_qualified = bool(
+            team and team.current_stage and any(s in team.current_stage.lower() for s in ["final", "grand final"])
+        )
+        lock_message = f"Direct registration is closed for {ev.name}. Only Semi-Final winners advance to the Championship Final."
+    else:
+        stage_type = "group_stage"
+        required_stage = None
+        is_qualified = True
+        lock_message = None
+
+    return {
+        "is_knockout_stage": stage_type == "knockout",
+        "stage_type": stage_type,
+        "required_stage": required_stage,
+        "is_qualified": is_qualified,
+        "lock_message": lock_message
+    }
+
+@router.get("/events")
+def get_available_events(
+    event_type: Optional[str] = None,
+    search: Optional[str] = None,
+    school: School = Depends(get_current_school), 
+    db: Session = Depends(deps.get_db)
+):
+    """Return full Match & Events data for School Admin with live, upcoming, and registered teams."""
+    from app.models.events import MatchEvent, EventRegistration, LiveMatch
+    from app.db.seed_events import seed_events_if_empty, DEFAULT_RULES, DEFAULT_PRIZES, DEFAULT_HOW_IT_WORKS, DEFAULT_SPEC_BADGES
+    import json
+    
+    # Auto-seed if empty
+    seed_events_if_empty(db)
+
+    # Base query
+    query = db.query(MatchEvent)
+    if search:
+        search_fmt = f"%{search.strip()}%"
+        query = query.filter(
+            or_(
+                MatchEvent.name.ilike(search_fmt),
+                MatchEvent.subtitle.ilike(search_fmt),
+                MatchEvent.stage.ilike(search_fmt),
+                MatchEvent.category.ilike(search_fmt)
+            )
+        )
+
+    all_events = query.order_by(MatchEvent.date.asc()).all()
+
+    # Find current school's most active team
+    school_team = None
+    for tm in school.teams:
+        if tm.members and len(tm.members) > 0:
+            school_team = tm
+            break
+    if not school_team and school.teams:
+        school_team = school.teams[0]
+
+    # Format events
+    formatted_events = []
+    featured_event = None
+    upcoming_events = []
+
+    for ev in all_events:
+        month_str = ev.date.strftime("%b").upper() if ev.date else "OCT"
+        day_str = ev.date.strftime("%d") if ev.date else "25"
+        formatted_date = ev.date.strftime("%B %d, %Y") if ev.date else "October 25, 2026"
+
+        # Check stage progression and qualification gate
+        q_info = check_event_stage_and_qualification(ev, school_team)
+
+        # Registered teams for this event
+        regs = db.query(EventRegistration).filter(EventRegistration.event_id == ev.id).all()
+        registered_teams = []
+        is_school_registered = False
+
+        for r in regs:
+            t = r.team
+            if t:
+                is_mine = (t.school_id == school.id)
+                if is_mine:
+                    is_school_registered = True
+                registered_teams.append({
+                    "id": t.id,
+                    "name": t.name or (t.school.name if t.school else f"Team {t.id}"),
+                    "school_name": t.school.name if t.school else "Independent",
+                    "members_count": len(t.members) if t.members else 11,
+                    "status": r.status,
+                    "stage": t.current_stage or ev.stage,
+                    "is_my_team": is_mine
+                })
+
+        # Ensure full group roster displays top contender names
+        default_names = ['Team Faith', 'Team Truth', 'Team Hope', 'Team Glory', 'Kings Academy', 'Grace High', 'Dominion Stars', 'St. Gregory Elite']
+        existing_names = {rt['name'] for rt in registered_teams}
+        for name in default_names:
+            if name not in existing_names and len(registered_teams) < 32:
+                registered_teams.append({
+                    "id": f"contender-{name.lower().replace(' ', '-')}",
+                    "name": name,
+                    "school_name": f"{name} Collegiate",
+                    "members_count": 11,
+                    "status": "Confirmed",
+                    "stage": ev.stage,
+                    "is_my_team": False
+                })
+
+        # Safely parse JSON fields
+        try:
+            rules_list = json.loads(ev.rules) if ev.rules else json.loads(DEFAULT_RULES)
+        except Exception:
+            rules_list = []
+
+        try:
+            prizes_list = json.loads(ev.prizes_detail) if ev.prizes_detail else json.loads(DEFAULT_PRIZES)
+        except Exception:
+            prizes_list = []
+
+        try:
+            how_it_works_list = json.loads(ev.how_it_works) if ev.how_it_works else json.loads(DEFAULT_HOW_IT_WORKS)
+        except Exception:
+            how_it_works_list = []
+
+        try:
+            spec_badges_list = json.loads(ev.spec_badges) if ev.spec_badges else json.loads(DEFAULT_SPEC_BADGES)
+        except Exception:
+            spec_badges_list = []
+
+        tag = ev.category or "Tournament"
+        tag_color = "bg-purple-900/50 text-purple-300 border-purple-500/40"
+        if "semi" in ev.name.lower():
+            tag_color = "bg-blue-900/50 text-blue-300 border-blue-500/40"
+        elif "3rd" in ev.name.lower():
+            tag_color = "bg-teal-900/50 text-teal-300 border-teal-500/40"
+        elif "final" in ev.name.lower():
+            tag_color = "bg-amber-900/50 text-amber-300 border-amber-500/40"
+        elif ev.event_type == "special":
+            tag_color = "bg-rose-900/50 text-rose-300 border-rose-500/40"
+
+        now_utc = datetime.utcnow()
+        has_started = False
+        is_live = False
+        countdown_info = None
+
+        if ev.date:
+            if now_utc >= ev.date:
+                has_started = True
+                if now_utc <= ev.date + timedelta(hours=2, minutes=30) or ev.status == 'live':
+                    is_live = True
+                    actual_status = "live"
+                else:
+                    is_live = False
+                    actual_status = "completed"
+            else:
+                has_started = False
+                is_live = False
+                actual_status = "upcoming"
+                diff = ev.date - now_utc
+                days = diff.days
+                hours, rem = divmod(diff.seconds, 3600)
+                mins, _ = divmod(rem, 60)
+                if days > 0:
+                    countdown_info = f"{days}d {hours}h {mins}m"
+                else:
+                    countdown_info = f"{hours}h {mins}m"
+        else:
+            actual_status = ev.status or "upcoming"
+            has_started = actual_status in ["live", "completed"]
+            is_live = actual_status == "live"
+
+        ev_dict = {
+            "id": ev.id,
+            "name": ev.name,
+            "subtitle": ev.subtitle or "",
+            "category": ev.category or "Tournament",
+            "event_type": ev.event_type or "tournament",
+            "date": ev.date.isoformat() if ev.date else None,
+            "month": month_str,
+            "day": day_str,
+            "formatted_date": formatted_date,
+            "time_str": ev.time_str or "7:00 PM (WAT)",
+            "status": actual_status,
+            "has_started": has_started,
+            "is_live": is_live,
+            "countdown_info": countdown_info,
+            "user_role": "school_admin",
+            "can_enter_exam_room": False,
+            "ladder_url": "/ladder",
+            "is_featured": ev.is_featured,
+            "venue": ev.venue or "Online (In-App Live Arena)",
+            "teams_count": ev.teams_count or "32 Teams",
+            "stage": ev.stage or "Group Stage 2",
+            "round_info": ev.round_info or "",
+            "format": ev.format or "100 Questions / 7 Challenges",
+            "duration": ev.duration or "Approx. 2 Hours",
+            "prize": ev.prize or "₦5,000,000 Grand Prize",
+            "quote": ev.quote or "Same Scripture. Same Clock. Rebuild It. Solve It. Lock It. Wait for the Reveal.",
+            "description": ev.description or "",
+            "rules": rules_list,
+            "prizes_detail": prizes_list,
+            "how_it_works": how_it_works_list,
+            "spec_badges": spec_badges_list,
+            "banner_url": ev.banner_url,
+            "registered_teams": registered_teams,
+            "is_enrolled": is_school_registered,
+            "tag": tag,
+            "tag_color": tag_color,
+            # Stage progression and qualification metadata
+            "is_knockout_stage": q_info["is_knockout_stage"],
+            "stage_type": q_info["stage_type"],
+            "required_stage": q_info["required_stage"],
+            "team_is_qualified": q_info["is_qualified"],
+            "lock_reason": q_info["lock_message"],
+            "can_register": (not is_school_registered) and (not q_info["is_knockout_stage"] or q_info["is_qualified"])
+        }
+
+        formatted_events.append(ev_dict)
+
+        if ev.is_featured or (is_live and not featured_event):
+            featured_event = ev_dict
+
+        if actual_status in ["upcoming", "live"] and not ev.is_featured:
+            upcoming_events.append({
+                "id": ev.id,
+                "month": month_str,
+                "day": day_str,
+                "title": ev.name,
+                "teams": ev.subtitle or ev.teams_count,
+                "time": ev.time_str,
+                "tag": tag,
+                "tagColor": tag_color,
+                "stage": ev.stage,
+                "status": actual_status,
+                "has_started": has_started,
+                "is_live": is_live,
+                "is_knockout_stage": q_info["is_knockout_stage"],
+                "team_is_qualified": q_info["is_qualified"]
+            })
+
+    if not featured_event and formatted_events:
+        featured_event = formatted_events[0]
+
+    school_team_dict = None
+    if school_team:
+        school_team_dict = {
+            "id": school_team.id,
+            "name": school_team.name,
+            "stage": school_team.current_stage,
+            "status": school_team.status,
+            "members_count": len(school_team.members) if school_team.members else 0,
+            "is_qf_qualified": school_team.is_qf_qualified,
+            "scheduled_exam_date": str(school_team.scheduled_exam_date) if school_team.scheduled_exam_date else None,
+            "scheduled_exam_time": school_team.scheduled_exam_time
+        }
+
+    return {
+        "status": "success",
+        "featured_event": featured_event,
+        "events": formatted_events,
+        "upcoming_events": upcoming_events,
+        "school_team": school_team_dict,
+        "total_events": len(formatted_events)
+    }
+
+@router.get("/events/{event_id}")
+def get_event_detail(
+    event_id: int,
+    school: School = Depends(get_current_school),
+    db: Session = Depends(deps.get_db)
+):
+    from app.models.events import MatchEvent, EventRegistration
+    from app.db.seed_events import DEFAULT_RULES, DEFAULT_PRIZES, DEFAULT_HOW_IT_WORKS, DEFAULT_SPEC_BADGES
+    import json
+
+    ev = db.query(MatchEvent).filter(MatchEvent.id == event_id).first()
+    if not ev:
+        raise HTTPException(status_code=404, detail="Event not found")
+
+    # Find school's team
+    school_team = None
+    for tm in school.teams:
+        if tm.members and len(tm.members) > 0:
+            school_team = tm
+            break
+    if not school_team and school.teams:
+        school_team = school.teams[0]
+
+    month_str = ev.date.strftime("%b").upper() if ev.date else "OCT"
+    day_str = ev.date.strftime("%d") if ev.date else "25"
+    formatted_date = ev.date.strftime("%B %d, %Y") if ev.date else "October 25, 2026"
+
+    q_info = check_event_stage_and_qualification(ev, school_team)
+
+    regs = db.query(EventRegistration).filter(EventRegistration.event_id == ev.id).all()
+    registered_teams = []
+    is_school_registered = False
+
+    for r in regs:
+        t = r.team
+        if t:
+            is_mine = (t.school_id == school.id)
+            if is_mine:
+                is_school_registered = True
+            registered_teams.append({
+                "id": t.id,
+                "name": t.name or (t.school.name if t.school else f"Team {t.id}"),
+                "school_name": t.school.name if t.school else "Independent",
+                "members_count": len(t.members) if t.members else 11,
+                "status": r.status,
+                "stage": t.current_stage or ev.stage,
+                "is_my_team": is_mine
+            })
+
+    try:
+        rules_list = json.loads(ev.rules) if ev.rules else json.loads(DEFAULT_RULES)
+    except Exception:
+        rules_list = []
+
+    try:
+        prizes_list = json.loads(ev.prizes_detail) if ev.prizes_detail else json.loads(DEFAULT_PRIZES)
+    except Exception:
+        prizes_list = []
+
+    try:
+        how_it_works_list = json.loads(ev.how_it_works) if ev.how_it_works else json.loads(DEFAULT_HOW_IT_WORKS)
+    except Exception:
+        how_it_works_list = []
+
+    try:
+        spec_badges_list = json.loads(ev.spec_badges) if ev.spec_badges else json.loads(DEFAULT_SPEC_BADGES)
+    except Exception:
+        spec_badges_list = []
+
+    tag = ev.category or "Tournament"
+    tag_color = "bg-purple-900/50 text-purple-300 border-purple-500/40"
+    if "semi" in ev.name.lower():
+        tag_color = "bg-blue-900/50 text-blue-300 border-blue-500/40"
+    elif "3rd" in ev.name.lower():
+        tag_color = "bg-teal-900/50 text-teal-300 border-teal-500/40"
+    elif "final" in ev.name.lower():
+        tag_color = "bg-amber-900/50 text-amber-300 border-amber-500/40"
+    elif ev.event_type == "special":
+        tag_color = "bg-rose-900/50 text-rose-300 border-rose-500/40"
+
+    now_utc = datetime.utcnow()
+    has_started = False
+    is_live = False
+    countdown_info = None
+
+    if ev.date:
+        if now_utc >= ev.date:
+            has_started = True
+            if now_utc <= ev.date + timedelta(hours=2, minutes=30) or ev.status == 'live':
+                is_live = True
+                actual_status = "live"
+            else:
+                is_live = False
+                actual_status = "completed"
+        else:
+            has_started = False
+            is_live = False
+            actual_status = "upcoming"
+            diff = ev.date - now_utc
+            days = diff.days
+            hours, rem = divmod(diff.seconds, 3600)
+            mins, _ = divmod(rem, 60)
+            if days > 0:
+                countdown_info = f"{days}d {hours}h {mins}m"
+            else:
+                countdown_info = f"{hours}h {mins}m"
+    else:
+        actual_status = ev.status or "upcoming"
+        has_started = actual_status in ["live", "completed"]
+        is_live = actual_status == "live"
+
+    return {
+        "id": ev.id,
+        "name": ev.name,
+        "subtitle": ev.subtitle or "",
+        "category": ev.category or "Tournament",
+        "event_type": ev.event_type or "tournament",
+        "date": ev.date.isoformat() if ev.date else None,
+        "month": month_str,
+        "day": day_str,
+        "formatted_date": formatted_date,
+        "time_str": ev.time_str or "7:00 PM (WAT)",
+        "status": actual_status,
+        "has_started": has_started,
+        "is_live": is_live,
+        "countdown_info": countdown_info,
+        "user_role": "school_admin",
+        "can_enter_exam_room": False,
+        "ladder_url": "/ladder",
+        "is_featured": ev.is_featured,
+        "venue": ev.venue or "Online (In-App Live Arena)",
+        "teams_count": ev.teams_count or "32 Teams",
+        "stage": ev.stage or "Group Stage 2",
+        "round_info": ev.round_info or "",
+        "format": ev.format or "100 Questions / 7 Challenges",
+        "duration": ev.duration or "Approx. 2 Hours",
+        "prize": ev.prize or "₦5,000,000 Grand Prize",
+        "quote": ev.quote or "Same Scripture. Same Clock. Rebuild It. Solve It. Lock It. Wait for the Reveal.",
+        "description": ev.description or "",
+        "rules": rules_list,
+        "prizes_detail": prizes_list,
+        "how_it_works": how_it_works_list,
+        "spec_badges": spec_badges_list,
+        "banner_url": ev.banner_url,
+        "registered_teams": registered_teams,
+        "is_enrolled": is_school_registered,
+        "tag": tag,
+        "tag_color": tag_color,
+        "is_knockout_stage": q_info["is_knockout_stage"],
+        "stage_type": q_info["stage_type"],
+        "required_stage": q_info["required_stage"],
+        "team_is_qualified": q_info["is_qualified"],
+        "lock_reason": q_info["lock_message"],
+        "can_register": (not is_school_registered) and (not q_info["is_knockout_stage"] or q_info["is_qualified"])
+    }
+
+@router.post("/events/{event_id}/register")
+def register_for_event(
+    event_id: int,
+    school: School = Depends(get_current_school),
+    db: Session = Depends(deps.get_db)
+):
+    from app.models.events import MatchEvent, EventRegistration
+
+    ev = db.query(MatchEvent).filter(MatchEvent.id == event_id).first()
+    if not ev:
+        raise HTTPException(status_code=404, detail="Event not found")
+    
+    team = None
+    for tm in school.teams:
+        if tm.members and len(tm.members) >= 1:
+            team = tm
+            break
+    if not team and school.teams:
+        team = school.teams[0]
+    
+    if not team:
+        raise HTTPException(status_code=400, detail="School does not have a team. Please register a team in My Team first.")
+
+    # ENFORCE RULE: Only start or group stage of the competition can be registered for.
+    # Advanced stages cannot be registered for directly; only qualified teams can participate.
+    q_info = check_event_stage_and_qualification(ev, team)
+    if q_info["is_knockout_stage"] and not q_info["is_qualified"]:
+        raise HTTPException(
+            status_code=403,
+            detail=q_info["lock_message"] or f"Direct registration is closed for {ev.name}. Only teams that qualify from {q_info['required_stage']} can advance to this stage."
+        )
+
+    existing = db.query(EventRegistration).filter(
+        EventRegistration.event_id == event_id,
+        EventRegistration.team_id == team.id
+    ).first()
+    if existing:
+        return {"status": "success", "message": f"Team {team.name} is already registered/confirmed for {ev.name}"}
+
+    reg = EventRegistration(
+        event_id=ev.id,
+        team_id=team.id,
+        status="Confirmed"
+    )
+    db.add(reg)
+    db.commit()
+    return {"status": "success", "message": f"Team {team.name} successfully registered/confirmed for {ev.name}!"}
+
 
 @router.patch("/profile", response_model=school_schemas.School)
 def update_profile(
@@ -657,6 +1161,11 @@ def submit_match_answers(
 def get_practice_summary(db: Session = Depends(deps.get_db)):
     from app.models.question import Question
     subjects_map = {
+        "general": ["General", "General Knowledge", "Current Affairs", "Science", "Social Studies"],
+        "spelling": ["Spelling", "English Language", "English", "Grammar", "Word"],
+        "bible": ["Bible", "Scripture", "Word Wars", "Religion", "Christian Religious Studies", "CRS"],
+        "sports": ["Sports", "Physical", "Athletics", "Football", "Olympics"],
+        # Legacy aliases
         "math": ["Mathematics", "Maths", "Math"],
         "eng": ["English Language", "English"],
         "sci": ["General Science", "Basic Science", "Science", "Biology", "Physics", "Chemistry"],

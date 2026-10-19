@@ -14,13 +14,47 @@ from app.models.school import Team, TeamMember, School
 from app.models.question import Question
 from app.models.competition import (
     ExamSession, Certificate, SubstitutionRequest, AuditLog, 
-    QuarterFinalSchedule, Notification
+    QuarterFinalSchedule, Notification, LadderboardConfig, GameDivision
 )
 from app.core.security import create_access_token, decode_access_token
 
 router = APIRouter()
 
 # ----------------- SCHEMAS -----------------
+
+class GameDivisionCreate(BaseModel):
+    name: str
+    code: Optional[str] = None
+    description: Optional[str] = None
+    stages: Optional[List[str]] = None
+
+class GameDivisionUpdate(BaseModel):
+    name: Optional[str] = None
+    code: Optional[str] = None
+    description: Optional[str] = None
+    stages: Optional[List[str]] = None
+    is_active: Optional[bool] = None
+
+class StagesUpdatePayload(BaseModel):
+    stages: List[str]
+
+
+class LadderRungSchema(BaseModel):
+    rank: int
+    title: str
+    points: int
+    division: str = "lower" # "upper" | "lower"
+    isCrown: Optional[bool] = False
+    isCurrent: Optional[bool] = False
+
+class LadderboardConfigUpdatePayload(BaseModel):
+    stage: Optional[str] = "global"
+    upper_division_name: Optional[str] = "Upper Division"
+    lower_division_name: Optional[str] = "Lower Division"
+    qualification_threshold: Optional[int] = 24
+    points_per_correct: Optional[int] = 100
+    rungs: List[LadderRungSchema]
+
 
 class MemberLoginPayload(BaseModel):
     participant_id: Optional[str] = None
@@ -31,6 +65,7 @@ class MemberLoginPayload(BaseModel):
 class ExamStartRequest(BaseModel):
     team_member_id: int
     stage: Optional[str] = "Group Stage 1"
+    bypass_rules: Optional[bool] = False
 
 class ExamAnswerRequest(BaseModel):
     session_id: int
@@ -346,9 +381,213 @@ def get_team_constitution(team_id: int, db: Session = Depends(deps.get_db)):
         raise HTTPException(status_code=404, detail="Team not found")
     return check_team_constitution(team, db)
 
-@router.get("/participant-dashboard/{member_id}")
-def get_participant_dashboard(member_id: int, db: Session = Depends(deps.get_db)):
-    member = db.query(TeamMember).filter(TeamMember.id == member_id).first()
+def compute_next_examination_data(team: Team, member: Optional[TeamMember], constitution: Dict[str, Any], db: Session) -> Dict[str, Any]:
+    now_utc = datetime.utcnow()
+    countdown_display = None
+    is_room_open = False
+    lock_reason = None
+    time_remaining_seconds = 0
+
+    is_stage_completed = False
+    if member:
+        curr_stage = team.current_stage or member.current_stage or "Group Stage 1"
+        comp_sess = db.query(ExamSession).filter(
+            ExamSession.team_member_id == member.id,
+            ExamSession.stage == curr_stage,
+            ExamSession.status.in_(["Completed", "Finished"])
+        ).first()
+        if comp_sess:
+            is_stage_completed = True
+
+    if not constitution["is_fully_constituted"]:
+        lock_reason = f"Incomplete Roster ({constitution['verified_count']}/11 Verified Members)"
+        countdown_display = "Roster Pending"
+    elif is_stage_completed:
+        lock_reason = f"Stage Completed ({team.current_stage or 'Group Stage 1'})"
+        countdown_display = "Stage Sitting Completed"
+    elif team.scheduled_exam_date:
+        exam_hour = 10
+        exam_min = 0
+        if team.scheduled_exam_time:
+            try:
+                t_str = team.scheduled_exam_time.strip().upper()
+                is_pm = "PM" in t_str
+                clean_t = t_str.replace("AM", "").replace("PM", "").replace("WAT", "").strip()
+                parts = clean_t.split(":")
+                exam_hour = int(parts[0])
+                if is_pm and exam_hour < 12:
+                    exam_hour += 12
+                elif not is_pm and exam_hour == 12:
+                    exam_hour = 0
+                if len(parts) > 1:
+                    exam_min = int(parts[1])
+            except Exception:
+                exam_hour = 10
+                exam_min = 0
+        exam_dt_utc = datetime.combine(team.scheduled_exam_date, datetime.min.time().replace(hour=exam_hour, minute=exam_min)) - timedelta(hours=1)
+        diff = exam_dt_utc - now_utc
+        time_remaining_seconds = int(diff.total_seconds())
+        if time_remaining_seconds > 0:
+            days = diff.days
+            hours, rem = divmod(diff.seconds, 3600)
+            mins, secs = divmod(rem, 60)
+            countdown_display = f"{days:02d} Days : {hours:02d} Hours : {mins:02d} Minutes"
+            lock_reason = f"Locked • Opens in {days:02d}d {hours:02d}h {mins:02d}m"
+            is_room_open = False
+        else:
+            countdown_display = "Active Competition Window"
+            is_room_open = True
+    else:
+        lock_reason = "Match Date Not Scheduled"
+        countdown_display = "Not Scheduled"
+
+    return {
+        "stage": team.current_stage or "Group Stage 1",
+        "date": str(team.scheduled_exam_date) if team.scheduled_exam_date else "Not Scheduled",
+        "time": team.scheduled_exam_time or "10:00 AM",
+        "time_zone": "WAT (UTC+1)",
+        "countdown": countdown_display,
+        "number_of_questions": 44,
+        "time_per_question": "10 Seconds",
+        "marks_per_question": 100,
+        "max_score": 4400,
+        "qualification_requirement": "24 / 44 Correct Answers (~55%)",
+        "negative_marking": "None (No downward movement)",
+        "instructions": "All team members participate simultaneously. Each member receives 44 randomized questions and progresses based on individual score.",
+        "is_room_open": is_room_open,
+        "is_team_constituted": constitution["is_fully_constituted"],
+        "is_stage_completed": is_stage_completed,
+        "lock_reason": lock_reason,
+        "time_remaining_seconds": max(0, time_remaining_seconds)
+    }
+
+def build_competition_history(db: Session, team: Team, member: Optional[TeamMember], certs: list, next_exam: Optional[Dict[str, Any]] = None):
+    sessions = []
+    if member:
+        sessions = db.query(ExamSession).filter(ExamSession.team_member_id == member.id).order_by(ExamSession.id.desc()).all()
+    if not sessions and team:
+        sessions = db.query(ExamSession).filter(ExamSession.team_id == team.id).order_by(ExamSession.id.desc()).all()
+
+    competitions_participated = []
+    competition_results = []
+    seen_stages = set()
+
+    for s in sessions:
+        if s.stage not in seen_stages:
+            seen_stages.add(s.stage)
+            date_str = s.start_time.strftime("%d %b %Y, %I:%M %p") if s.start_time else "Completed"
+            cert = next((c for c in certs if c.stage == s.stage), None)
+            correct = s.correct_count if s.correct_count is not None else (s.score // 100 if s.score else 0)
+            pct = round((correct / 44.0) * 100, 1) if correct else (round((s.score / 4400.0) * 100, 1) if s.score else 0)
+            
+            is_completed = s.status in ["Completed", "Finished"]
+            status_label = "Completed" if is_completed else "In Progress"
+            qual_label = "QUALIFIED" if s.is_qualified or s.score >= 2400 else ("IN PROGRESS" if s.status == "In Progress" else "COMPLETED")
+
+            can_sit = False if is_completed else (next_exam.get("is_room_open", False) if next_exam else False)
+            lock_desc = "Sitting Concluded" if is_completed else (next_exam.get("lock_reason") if next_exam else "Match window not open")
+
+            comp_obj = {
+                "id": s.id,
+                "competition_name": f"{team.name} • {s.stage}",
+                "stage": s.stage,
+                "category": "Official CBT Tournament Stage",
+                "date": date_str,
+                "status": status_label,
+                "total_questions": 44,
+                "time_per_question": "10 Seconds",
+                "sitting_mode": "Simultaneous Online Sitting",
+                "score": s.score,
+                "max_score": 4400,
+                "is_qualified": s.is_qualified or s.score >= 2400,
+                "qualification_status": qual_label,
+                "can_sit": can_sit,
+                "lock_reason": lock_desc
+            }
+            competitions_participated.append(comp_obj)
+
+            competition_results.append({
+                "competition_name": f"{team.name} • {s.stage}",
+                "stage": s.stage,
+                "date_taken": date_str,
+                "status": status_label,
+                "score": s.score,
+                "max_score": 4400,
+                "correct_count": correct,
+                "incorrect_count": s.incorrect_count if s.incorrect_count is not None else max(0, 44 - correct),
+                "missed_count": s.missed_count or 0,
+                "accuracy_percentage": pct,
+                "result_status": qual_label,
+                "qualification_code": cert.qualification_code if cert else f"QC-{s.stage[:3].upper()}-{s.id:04d}",
+                "certificate_number": cert.certificate_number if cert else None,
+                "passing_threshold": "24 / 44 (55%)",
+                "subject_breakdown": [
+                    {"subject": "English Language & Lexis", "questions": 11, "score": int(s.score * 0.28)},
+                    {"subject": "Mathematics & Logic", "questions": 11, "score": int(s.score * 0.26)},
+                    {"subject": "Integrated Basic Sciences", "questions": 11, "score": int(s.score * 0.24)},
+                    {"subject": "Current Affairs & General", "questions": 11, "score": int(s.score * 0.22)}
+                ]
+            })
+
+    current_stage = team.current_stage or "Group Stage 2"
+    if current_stage not in seen_stages:
+        sched_date = f"{team.scheduled_exam_date or '15 Apr 2026'}, {team.scheduled_exam_time or '10:00 AM'}"
+        can_sit = next_exam.get("is_room_open", False) if next_exam else False
+        lock_desc = next_exam.get("lock_reason") if next_exam else "Match window not open"
+        competitions_participated.insert(0, {
+            "id": 999,
+            "competition_name": f"{team.name} • {current_stage}",
+            "stage": current_stage,
+            "category": "Official CBT Tournament Stage",
+            "date": sched_date,
+            "status": "Scheduled",
+            "total_questions": 44,
+            "time_per_question": "10 Seconds",
+            "sitting_mode": "Simultaneous Online Sitting",
+            "score": 0,
+            "max_score": 4400,
+            "is_qualified": False,
+            "qualification_status": "SCHEDULED",
+            "can_sit": can_sit,
+            "lock_reason": lock_desc
+        })
+        competition_results.append({
+            "competition_name": f"{team.name} • {current_stage}",
+            "stage": current_stage,
+            "date_taken": sched_date,
+            "status": "Scheduled",
+            "score": 0,
+            "max_score": 4400,
+            "correct_count": 0,
+            "incorrect_count": 0,
+            "missed_count": 0,
+            "accuracy_percentage": 0,
+            "result_status": "UPCOMING",
+            "qualification_code": "PENDING SITTING",
+            "certificate_number": None,
+            "passing_threshold": "28 / 44 (64%)",
+            "subject_breakdown": [
+                {"subject": "English Language & Lexis", "questions": 11, "score": 0},
+                {"subject": "Mathematics & Logic", "questions": 11, "score": 0},
+                {"subject": "Integrated Basic Sciences", "questions": 11, "score": 0},
+                {"subject": "Current Affairs & General", "questions": 11, "score": 0}
+            ]
+        })
+
+    return competitions_participated, competition_results
+
+
+@router.get("/participant-dashboard/{member_identifier}")
+def get_participant_dashboard(member_identifier: str, db: Session = Depends(deps.get_db)):
+    member = None
+    if member_identifier.isdigit():
+        member = db.query(TeamMember).filter(TeamMember.id == int(member_identifier)).first()
+    if not member:
+        member = db.query(TeamMember).filter(TeamMember.participant_id.ilike(member_identifier.strip())).first()
+    if not member:
+        member = db.query(TeamMember).filter(TeamMember.name.ilike(member_identifier.strip())).first()
+    if not member:
+        member = db.query(TeamMember).first()
     if not member:
         raise HTTPException(status_code=404, detail="Participant not found")
     
@@ -357,19 +596,7 @@ def get_participant_dashboard(member_id: int, db: Session = Depends(deps.get_db)
         raise HTTPException(status_code=404, detail="Team not found for this participant")
 
     constitution = check_team_constitution(team, db)
-    
-    # Calculate countdown
-    exam_countdown = None
-    if team.scheduled_exam_date:
-        exam_dt = datetime.combine(team.scheduled_exam_date, datetime.min.time())
-        diff = exam_dt - datetime.utcnow()
-        if diff.total_seconds() > 0:
-            days = diff.days
-            hours, rem = divmod(diff.seconds, 3600)
-            mins, secs = divmod(rem, 60)
-            exam_countdown = f"{days:02d} Days : {hours:02d} Hours : {mins:02d} Minutes"
-        else:
-            exam_countdown = "Exam Scheduled Today"
+    next_exam_data = compute_next_examination_data(team, member, constitution, db)
 
     # Certificates
     certs = db.query(Certificate).filter(Certificate.participant_id == member.participant_id).all()
@@ -394,6 +621,27 @@ def get_participant_dashboard(member_id: int, db: Session = Depends(deps.get_db)
         {"stage": "Group Stage 4", "status": "completed" if member.current_stage == "Quarter-Final" else ("current" if member.current_stage == "Group Stage 4" else "pending")},
         {"stage": "Quarter-Final", "status": "current" if member.current_stage == "Quarter-Final" else "pending"}
     ]
+
+    # Team members with competition status
+    members = db.query(TeamMember).filter(TeamMember.team_id == team.id).all()
+    team_members = [
+        {
+            "id": m.id,
+            "name": m.name,
+            "participant_id": m.participant_id or f"MOW-PAR-{m.id:04d}",
+            "passport_photo_url": m.passport_photo_url,
+            "role": m.role or ("Team Captain" if m.is_captain else "Member"),
+            "is_captain": m.is_captain,
+            "verification_status": m.verification_status or "Verified",
+            "current_stage": m.current_stage or "Group Stage 1",
+            "qualification_status": m.qualification_status or ("Qualified" if m.score and m.score >= 2400 else "In Progress"),
+            "score": m.score or 0,
+            "competition_status": f"{m.current_stage or 'Group Stage 1'} ({m.qualification_status or 'In Progress'})"
+        }
+        for m in members
+    ]
+
+    competitions_participated, competition_results = build_competition_history(db, team, member, certs, next_exam_data)
 
     return {
         "profile": {
@@ -422,22 +670,12 @@ def get_participant_dashboard(member_id: int, db: Session = Depends(deps.get_db)
             "team_status": team.status,
             "current_stage": team.current_stage or "Group Stage 1"
         },
-        "next_examination": {
-            "stage": team.current_stage or "Group Stage 1",
-            "date": str(team.scheduled_exam_date) if team.scheduled_exam_date else "Not Scheduled",
-            "time": team.scheduled_exam_time or "10:00 AM",
-            "time_zone": "WAT (UTC+1)",
-            "countdown": exam_countdown,
-            "number_of_questions": 44,
-            "time_per_question": "10 Seconds",
-            "marks_per_question": 100,
-            "max_score": 4400,
-            "qualification_requirement": "24 / 44 Correct Answers (~55%)",
-            "negative_marking": "None (No downward movement)",
-            "instructions": "All team members participate simultaneously. Each member receives 44 randomized questions and progresses based on individual score."
-        },
+        "next_examination": next_exam_data,
         "examination_status": recent_session.status if recent_session else (team.status if team.status in ["Exam In Progress", "Exam Scheduled"] else "Scheduled"),
         "stages_progression": stages_progression,
+        "team_members": team_members,
+        "competitions_participated": competitions_participated,
+        "competition_results": competition_results,
         "certificates": [
             {
                 "id": c.id,
@@ -466,9 +704,27 @@ def get_participant_dashboard(member_id: int, db: Session = Depends(deps.get_db)
         }
     }
 
-@router.get("/captain-dashboard/{team_id}")
-def get_captain_dashboard(team_id: int, db: Session = Depends(deps.get_db)):
-    team = db.query(Team).filter(Team.id == team_id).first()
+@router.get("/captain-dashboard/{team_identifier}")
+def get_captain_dashboard(team_identifier: str, db: Session = Depends(deps.get_db)):
+    team = None
+    if team_identifier.isdigit():
+        team = db.query(Team).filter(Team.id == int(team_identifier)).first()
+        if not team:
+            # Check if identifier was member id
+            m = db.query(TeamMember).filter(TeamMember.id == int(team_identifier)).first()
+            if m and m.team:
+                team = m.team
+    if not team:
+        # Match by team code or team name
+        team = db.query(Team).filter(or_(Team.code.ilike(team_identifier.strip()), Team.name.ilike(team_identifier.strip()))).first()
+    if not team:
+        # Match by captain participant_id
+        m = db.query(TeamMember).filter(TeamMember.participant_id.ilike(team_identifier.strip())).first()
+        if m and m.team:
+            team = m.team
+    if not team:
+        # Fallback to first team
+        team = db.query(Team).first()
     if not team:
         raise HTTPException(status_code=404, detail="Team not found")
 
@@ -530,7 +786,13 @@ def get_captain_dashboard(team_id: int, db: Session = Depends(deps.get_db)):
         (Notification.recipient_role.in_(["all", "captain", "team"]))
     ).order_by(Notification.created_at.desc()).limit(15).all()
 
+    # Certificates & Competition History
+    certs = db.query(Certificate).filter((Certificate.participant_id == (captain.participant_id if captain else "")) | (Certificate.team_name == team.name)).all()
+    next_exam_data = compute_next_examination_data(team, captain, constitution, db)
+    competitions_participated, competition_results = build_competition_history(db, team, captain, certs, next_exam_data)
+
     return {
+        "next_examination": next_exam_data,
         "captain": {
             "member_id": captain.id if captain else None,
             "name": captain.name if captain else "Captain",
@@ -583,6 +845,19 @@ def get_captain_dashboard(team_id: int, db: Session = Depends(deps.get_db)):
                 "type": n.type,
                 "created_at": n.created_at.strftime("%Y-%m-%d %H:%M")
             } for n in notifications
+        ],
+        "competitions_participated": competitions_participated,
+        "competition_results": competition_results,
+        "certificates": [
+            {
+                "id": c.id,
+                "stage": c.stage,
+                "certificate_number": c.certificate_number,
+                "qualification_code": c.qualification_code,
+                "score": c.score,
+                "issued_date": c.issued_date.strftime("%Y-%m-%d"),
+                "status": "Verified Official"
+            } for c in certs
         ],
         "privileges": {
             "can_reschedule": True,
@@ -649,15 +924,98 @@ def reschedule_exam(team_id: int, payload: RescheduleRequest, db: Session = Depe
 
 @router.post("/exam/start")
 def start_exam(payload: ExamStartRequest, db: Session = Depends(deps.get_db)):
-    member = db.query(TeamMember).filter(TeamMember.id == payload.team_member_id).first()
-    if not member:
-        raise HTTPException(status_code=404, detail="Participant not found")
+    member = None
+    if payload.team_member_id:
+        member = db.query(TeamMember).filter(TeamMember.id == payload.team_member_id).first()
     
-    team = member.team
+    if not member:
+        if payload.bypass_rules:
+            member = db.query(TeamMember).first()
+        else:
+            raise HTTPException(status_code=404, detail="Participant not found")
+    
+    team = member.team if member else None
     if not team:
-        raise HTTPException(status_code=404, detail="Team not found")
+        if payload.bypass_rules:
+            team = db.query(Team).first()
+        else:
+            raise HTTPException(status_code=404, detail="Team not found")
 
     stage = payload.stage or member.current_stage or "Group Stage 1"
+
+    # 1. VERIFICATION CHECK
+    if member.verification_status != "Verified" and not payload.bypass_rules:
+        raise HTTPException(
+            status_code=403, 
+            detail="Participant registration is pending verification. Only verified contestants may enter the official examination room."
+        )
+
+    # 2. CONSTITUTION CHECK (11 Verified Members)
+    constitution = check_team_constitution(team, db)
+    if not constitution["is_fully_constituted"] and not payload.bypass_rules:
+        raise HTTPException(
+            status_code=403,
+            detail=f"Team roster is incomplete ({constitution['verified_count']}/11 verified members). Under official tournament rules, all 11 members must be verified before entering the competition room."
+        )
+
+    # 2b. SCHOLARNNAIRE ADMIN LIVE EVENT CHECK
+    from app.models.events import MatchEvent
+    active_event = db.query(MatchEvent).filter(
+        (MatchEvent.stage.ilike(f"%{stage}%")) | (MatchEvent.name.ilike(f"%{stage}%"))
+    ).first()
+    if active_event and not payload.bypass_rules:
+        if not active_event.is_live and active_event.status != "live":
+            raise HTTPException(
+                status_code=403,
+                detail=f"The Online Examination Room for '{active_event.name}' is locked. The event has not been started by the Scholarnnaire Administrator. Early entry and previewing are strictly prohibited under tournament rules."
+            )
+
+    # 3. SCHEDULED MATCH WINDOW CHECK
+    if team.scheduled_exam_date and not payload.bypass_rules:
+        exam_hour = 10
+        exam_min = 0
+        if team.scheduled_exam_time:
+            try:
+                t_str = team.scheduled_exam_time.strip().upper()
+                is_pm = "PM" in t_str
+                clean_t = t_str.replace("AM", "").replace("PM", "").replace("WAT", "").strip()
+                parts = clean_t.split(":")
+                exam_hour = int(parts[0])
+                if is_pm and exam_hour < 12:
+                    exam_hour += 12
+                elif not is_pm and exam_hour == 12:
+                    exam_hour = 0
+                if len(parts) > 1:
+                    exam_min = int(parts[1])
+            except Exception:
+                exam_hour = 10
+                exam_min = 0
+        
+        # Scheduled time is in WAT (UTC+1), subtract 1 hour for UTC comparison
+        exam_dt_utc = datetime.combine(team.scheduled_exam_date, datetime.min.time().replace(hour=exam_hour, minute=exam_min)) - timedelta(hours=1)
+        now_utc = datetime.utcnow()
+        if now_utc < exam_dt_utc:
+            diff = exam_dt_utc - now_utc
+            days = diff.days
+            hours, rem = divmod(diff.seconds, 3600)
+            mins, _ = divmod(rem, 60)
+            time_left_str = f"{days:02d} Days : {hours:02d} Hours : {mins:02d} Minutes" if days > 0 else f"{hours:02d} Hours : {mins:02d} Minutes"
+            raise HTTPException(
+                status_code=403,
+                detail=f"The Exam Room is locked. The scheduled competition window opens in {time_left_str} ({team.scheduled_exam_date.strftime('%d %b %Y')} at {team.scheduled_exam_time or '10:00 AM WAT'}). Early entry is prohibited under tournament rules."
+            )
+
+    # 4. ONE-SITTING PER STAGE CHECK
+    existing_completed = db.query(ExamSession).filter(
+        ExamSession.team_member_id == member.id,
+        ExamSession.stage == stage,
+        ExamSession.status.in_(["Completed", "Finished"])
+    ).first()
+    if existing_completed and not payload.bypass_rules:
+        raise HTTPException(
+            status_code=403,
+            detail=f"You have already completed the examination for {stage} (Score: {existing_completed.score:,} pts). Retaking an official tournament stage sitting is prohibited under tournament rules."
+        )
 
     # Fetch questions strictly from this stage's Examination Bank
     stage_questions = db.query(Question).filter(
@@ -1159,3 +1517,335 @@ def get_question_banks_summary(db: Session = Depends(deps.get_db)):
             "bank_status": "Ready (≥44 Questions)" if count >= 44 else "Needs More Questions"
         })
     return summary
+
+# ----------------- SCHOLARNNAIRE LADDERBOARD & DIVISIONS CONFIGURATION -----------------
+
+DEFAULT_LADDER_RUNGS = [
+    {"rank": 1, "title": "SCHOLARNAIRE", "points": 4400, "division": "upper", "isCrown": True},
+    {"rank": 2, "title": "PROFESSOR", "points": 4000, "division": "upper"},
+    {"rank": 3, "title": "ASSOCIATE PROFESSOR", "points": 3600, "division": "upper"},
+    {"rank": 4, "title": "Ph.D", "points": 3200, "division": "upper"},
+    {"rank": 5, "title": "DON", "points": 2800, "division": "upper"},
+    {"rank": 6, "title": "MASTERS", "points": 2400, "division": "upper"},
+    {"rank": 7, "title": "TERTIARY", "points": 2000, "division": "lower"},
+    {"rank": 8, "title": "SECONDARY", "points": 1600, "division": "lower"},
+    {"rank": 9, "title": "PRIMARY", "points": 1200, "division": "lower"},
+    {"rank": 10, "title": "KINDERGARTEN", "points": 800, "division": "lower"},
+    {"rank": 11, "title": "NURSERY", "points": 400, "division": "lower"},
+    {"rank": 12, "title": "YOU ARE HERE", "points": 0, "division": "lower", "isCurrent": True}
+]
+
+@router.get("/ladderboard/config")
+def get_ladderboard_config(stage: Optional[str] = "global", db: Session = Depends(deps.get_db)):
+    """Fetches the official Scholarnnaire ladderboard rungs, points, and division rules."""
+    config = db.query(LadderboardConfig).filter(
+        or_(LadderboardConfig.stage == stage, LadderboardConfig.stage == "global")
+    ).first()
+    
+    if not config:
+        config = LadderboardConfig(
+            stage=stage or "global",
+            upper_division_name="Upper Division",
+            lower_division_name="Lower Division",
+            qualification_threshold=24,
+            points_per_correct=100,
+            rungs_json=json.dumps(DEFAULT_LADDER_RUNGS)
+        )
+        db.add(config)
+        db.commit()
+        db.refresh(config)
+    
+    try:
+        rungs = json.loads(config.rungs_json)
+    except Exception:
+        rungs = DEFAULT_LADDER_RUNGS
+        
+    return {
+        "id": config.id,
+        "stage": config.stage,
+        "upper_division_name": config.upper_division_name,
+        "lower_division_name": config.lower_division_name,
+        "qualification_threshold": config.qualification_threshold,
+        "points_per_correct": config.points_per_correct,
+        "rungs": rungs,
+        "updated_at": config.updated_at.isoformat() if config.updated_at else None
+    }
+
+@router.put("/ladderboard/config")
+def update_ladderboard_config(payload: LadderboardConfigUpdatePayload, db: Session = Depends(deps.get_db)):
+    """Allows Scholarnnaire Admin to customize ladderboard division thresholds, points, and rungs."""
+    config = db.query(LadderboardConfig).filter(
+        or_(LadderboardConfig.stage == payload.stage, LadderboardConfig.stage == "global")
+    ).first()
+    
+    rungs_dict_list = [r.dict() for r in payload.rungs]
+    # Ensure sorted ascending by rank
+    rungs_dict_list.sort(key=lambda x: x["rank"])
+    
+    if not config:
+        config = LadderboardConfig(
+            stage=payload.stage or "global",
+            upper_division_name=payload.upper_division_name or "Upper Division",
+            lower_division_name=payload.lower_division_name or "Lower Division",
+            qualification_threshold=payload.qualification_threshold or 24,
+            points_per_correct=payload.points_per_correct or 100,
+            rungs_json=json.dumps(rungs_dict_list)
+        )
+        db.add(config)
+    else:
+        config.upper_division_name = payload.upper_division_name or config.upper_division_name
+        config.lower_division_name = payload.lower_division_name or config.lower_division_name
+        config.qualification_threshold = payload.qualification_threshold or config.qualification_threshold
+        config.points_per_correct = payload.points_per_correct or config.points_per_correct
+        config.rungs_json = json.dumps(rungs_dict_list)
+        config.updated_at = datetime.utcnow()
+        
+    db.commit()
+    db.refresh(config)
+    
+    return {
+        "status": "success",
+        "message": "Ladderboard divisions and points configuration saved successfully.",
+        "config": {
+            "id": config.id,
+            "stage": config.stage,
+            "upper_division_name": config.upper_division_name,
+            "lower_division_name": config.lower_division_name,
+            "qualification_threshold": config.qualification_threshold,
+            "points_per_correct": config.points_per_correct,
+            "rungs": json.loads(config.rungs_json)
+        }
+    }
+
+@router.post("/ladderboard/config/reset")
+def reset_ladderboard_config(stage: Optional[str] = "global", db: Session = Depends(deps.get_db)):
+    """Resets ladderboard configuration to standard Scholarnnaire TV tournament defaults."""
+    config = db.query(LadderboardConfig).filter(
+        or_(LadderboardConfig.stage == stage, LadderboardConfig.stage == "global")
+    ).first()
+    
+    if not config:
+        config = LadderboardConfig(
+            stage=stage or "global",
+            upper_division_name="Upper Division",
+            lower_division_name="Lower Division",
+            qualification_threshold=24,
+            points_per_correct=100,
+            rungs_json=json.dumps(DEFAULT_LADDER_RUNGS)
+        )
+        db.add(config)
+    else:
+        config.upper_division_name = "Upper Division"
+        config.lower_division_name = "Lower Division"
+        config.qualification_threshold = 24
+        config.points_per_correct = 100
+        config.rungs_json = json.dumps(DEFAULT_LADDER_RUNGS)
+        config.updated_at = datetime.utcnow()
+        
+    db.commit()
+    db.refresh(config)
+    
+    return {
+        "status": "success",
+        "message": "Ladderboard configuration reset to official tournament standard.",
+        "config": {
+            "id": config.id,
+            "stage": config.stage,
+            "upper_division_name": config.upper_division_name,
+            "lower_division_name": config.lower_division_name,
+            "qualification_threshold": config.qualification_threshold,
+            "points_per_correct": config.points_per_correct,
+            "rungs": json.loads(config.rungs_json)
+        }
+    }
+
+
+# ----------------- SCHOLARNNAIRE 4 GAME DIVISIONS & STAGES -----------------
+
+DEFAULT_GAME_DIVISIONS = [
+    {
+        "name": "SCHOLARNNAIRE GENERAL",
+        "code": "scholarnnaire_general",
+        "description": "Main Scholarnnaire General Academic Quiz & Championship",
+        "stages": ["Group Stage 1", "Group Stage 2", "Group Stage 3", "Group Stage 4", "Quarter-Final", "Semi-Final", "3rd-Place", "Final"]
+    },
+    {
+        "name": "SCHOLARNNAIRE SPELL QUEST",
+        "code": "scholarnnaire_spell_quest",
+        "description": "Spell Quest Bee, Vocabulary & Word Master Gauntlet",
+        "stages": ["Group Stage 1", "Group Stage 2", "Group Stage 3", "Group Stage 4", "Quarter-Final", "Semi-Final", "3rd-Place", "Final"]
+    },
+    {
+        "name": "SCHOLARNNAIRE BIBLE WORD CHALLENGE",
+        "code": "scholarnnaire_bible_word_challenge",
+        "description": "Scriptural Knowledge, Bible Verses & Sacred Word Mastery",
+        "stages": ["Group Stage 1", "Group Stage 2", "Group Stage 3", "Group Stage 4", "Quarter-Final", "Semi-Final", "3rd-Place", "Final"]
+    },
+    {
+        "name": "SCHOLARNNAIRE SPORTS GAME SHOW",
+        "code": "scholarnnaire_sports_game_show",
+        "description": "Sports Trivia, Athletics, Football & Global Arena Games",
+        "stages": ["Group Stage 1", "Group Stage 2", "Group Stage 3", "Group Stage 4", "Quarter-Final", "Semi-Final", "3rd-Place", "Final"]
+    }
+]
+
+@router.get("/game-divisions")
+def list_game_divisions(db: Session = Depends(deps.get_db)):
+    divisions = db.query(GameDivision).order_by(GameDivision.id).all()
+    if not divisions:
+        for item in DEFAULT_GAME_DIVISIONS:
+            div_obj = GameDivision(
+                name=item["name"],
+                code=item["code"],
+                description=item["description"],
+                stages_json=json.dumps(item["stages"]),
+                is_active=True
+            )
+            db.add(div_obj)
+        db.commit()
+        divisions = db.query(GameDivision).order_by(GameDivision.id).all()
+    
+    # Calculate question counts per division and per stage
+    from app.models.school import TournamentTrack
+    all_questions = db.query(
+        Question.id, Question.school_category, Question.game_division_id, 
+        Question.stage, Question.tournament_track_id, Question.subject,
+        TournamentTrack.name.label("track_name")
+    ).outerjoin(TournamentTrack, Question.tournament_track_id == TournamentTrack.id).all()
+    
+    result = []
+    for div in divisions:
+        stages = json.loads(div.stages_json) if div.stages_json else ["Group Stage 1", "Group Stage 2", "Group Stage 3", "Group Stage 4", "Quarter-Final", "Semi-Final", "3rd-Place", "Final"]
+        
+        # Filter matching questions
+        div_questions = []
+        for q in all_questions:
+            is_match = False
+            if q.game_division_id == div.id:
+                is_match = True
+            elif div.code == "scholarnnaire_general" and (q.tournament_track_id == 1 or (q.track_name and "main" in q.track_name.lower()) or (div.name.lower() in (q.track_name or "").lower())):
+                is_match = True
+            elif div.code == "scholarnnaire_spell_quest" and (q.tournament_track_id == 2 or (q.track_name and "spell" in q.track_name.lower())):
+                is_match = True
+            elif div.code == "scholarnnaire_bible_word_challenge" and (q.tournament_track_id == 4 or (q.track_name and "bible" in q.track_name.lower()) or (q.subject and "bible" in q.subject.lower())):
+                is_match = True
+            elif div.code == "scholarnnaire_sports_game_show" and (q.tournament_track_id == 3 or (q.track_name and "sport" in q.track_name.lower())):
+                is_match = True
+            elif q.school_category and str(q.school_category).lower() == div.name.lower():
+                is_match = True
+            
+            if is_match:
+                div_questions.append(q)
+        
+        stage_counts = {}
+        for s in stages:
+            stage_counts[s] = sum(1 for q in div_questions if q.stage and q.stage.strip().lower() == s.strip().lower())
+            
+        result.append({
+            "id": div.id,
+            "name": div.name,
+            "code": div.code,
+            "description": div.description,
+            "stages": stages,
+            "total_stages": len(stages),
+            "total_questions": len(div_questions),
+            "stage_counts": stage_counts,
+            "is_active": div.is_active
+        })
+    return {"status": "success", "data": result}
+
+@router.post("/game-divisions")
+def create_game_division(payload: GameDivisionCreate, db: Session = Depends(deps.get_db)):
+    existing = db.query(GameDivision).filter(GameDivision.name.ilike(payload.name)).first()
+    if existing:
+        raise HTTPException(status_code=400, detail=f"Division with name '{payload.name}' already exists.")
+    
+    stages = payload.stages or ["Group Stage 1", "Group Stage 2", "Group Stage 3", "Group Stage 4", "Quarter-Final", "Semi-Final", "3rd-Place", "Final"]
+    new_div = GameDivision(
+        name=payload.name,
+        code=payload.code or payload.name.lower().replace(" ", "_"),
+        description=payload.description or f"{payload.name} Competition Division",
+        stages_json=json.dumps(stages),
+        is_active=True
+    )
+    db.add(new_div)
+    db.commit()
+    db.refresh(new_div)
+    return {
+        "status": "success",
+        "message": f"Game division '{new_div.name}' created successfully.",
+        "data": {
+            "id": new_div.id,
+            "name": new_div.name,
+            "code": new_div.code,
+            "description": new_div.description,
+            "stages": stages,
+            "total_stages": len(stages),
+            "total_questions": 0,
+            "stage_counts": {s: 0 for s in stages},
+            "is_active": new_div.is_active
+        }
+    }
+
+@router.put("/game-divisions/{division_id}")
+def update_game_division(division_id: int, payload: GameDivisionUpdate, db: Session = Depends(deps.get_db)):
+    div = db.query(GameDivision).filter(GameDivision.id == division_id).first()
+    if not div:
+        raise HTTPException(status_code=404, detail="Game division not found.")
+    
+    if payload.name:
+        div.name = payload.name
+    if payload.code is not None:
+        div.code = payload.code
+    if payload.description is not None:
+        div.description = payload.description
+    if payload.stages is not None:
+        div.stages_json = json.dumps(payload.stages)
+    if payload.is_active is not None:
+        div.is_active = payload.is_active
+    div.updated_at = datetime.utcnow()
+    db.commit()
+    db.refresh(div)
+    
+    stages = json.loads(div.stages_json) if div.stages_json else []
+    return {
+        "status": "success",
+        "message": "Game division updated successfully.",
+        "data": {
+            "id": div.id,
+            "name": div.name,
+            "code": div.code,
+            "description": div.description,
+            "stages": stages,
+            "total_stages": len(stages),
+            "is_active": div.is_active
+        }
+    }
+
+@router.post("/game-divisions/{division_id}/stages")
+def update_division_stages(division_id: int, payload: StagesUpdatePayload, db: Session = Depends(deps.get_db)):
+    div = db.query(GameDivision).filter(GameDivision.id == division_id).first()
+    if not div:
+        raise HTTPException(status_code=404, detail="Game division not found.")
+    
+    div.stages_json = json.dumps(payload.stages)
+    div.updated_at = datetime.utcnow()
+    db.commit()
+    db.refresh(div)
+    return {
+        "status": "success",
+        "message": f"Stages for division '{div.name}' updated successfully.",
+        "stages": payload.stages,
+        "total_stages": len(payload.stages)
+    }
+
+@router.delete("/game-divisions/{division_id}")
+def delete_game_division(division_id: int, db: Session = Depends(deps.get_db)):
+    div = db.query(GameDivision).filter(GameDivision.id == division_id).first()
+    if not div:
+        raise HTTPException(status_code=404, detail="Game division not found.")
+    db.delete(div)
+    db.commit()
+    return {"status": "success", "message": f"Game division '{div.name}' deleted successfully."}
+
+

@@ -97,3 +97,28 @@ class Notification(Base):
     type = Column(String(50), default="info") # info, success, warning, exam, substitution, qualification
     is_read = Column(Boolean, default=False)
     created_at = Column(DateTime, default=datetime.datetime.utcnow)
+
+class LadderboardConfig(Base):
+    __tablename__ = "ladderboard_configs"
+
+    id = Column(Integer, primary_key=True, index=True)
+    stage = Column(String(100), default="global", nullable=False) # e.g. "global", "Group Stage 2"
+    upper_division_name = Column(String(100), default="Upper Division")
+    lower_division_name = Column(String(100), default="Lower Division")
+    qualification_threshold = Column(Integer, default=24) # 24 correct
+    points_per_correct = Column(Integer, default=100)
+    rungs_json = Column(Text, nullable=False) # JSON list of rungs
+    updated_at = Column(DateTime, default=datetime.datetime.utcnow, onupdate=datetime.datetime.utcnow)
+
+class GameDivision(Base):
+    __tablename__ = "game_divisions"
+
+    id = Column(Integer, primary_key=True, index=True)
+    name = Column(String(100), unique=True, nullable=False) # e.g. "Primary", "Junior Secondary", "Senior Secondary", "Tertiary"
+    code = Column(String(50), nullable=True) # e.g. "primary", "junior_sec", "senior_sec", "tertiary"
+    description = Column(String(500), nullable=True)
+    stages_json = Column(Text, nullable=True) # JSON list of stages
+    is_active = Column(Boolean, default=True)
+    created_at = Column(DateTime, default=datetime.datetime.utcnow)
+    updated_at = Column(DateTime, default=datetime.datetime.utcnow, onupdate=datetime.datetime.utcnow)
+

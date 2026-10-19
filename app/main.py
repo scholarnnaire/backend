@@ -51,7 +51,7 @@ app.mount("/static", StaticFiles(directory="static"), name="static")
 
 @app.get("/")
 def read_root():
-    return {"message": "Welcome to Millionaires on Wheels API"}
+    return {"message": "Welcome to Who Wants To be A Scholarnnaire API"}
 
 @app.websocket("/ws/{client_id}")
 async def websocket_endpoint(websocket: WebSocket, client_id: str):

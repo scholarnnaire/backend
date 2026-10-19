@@ -3,7 +3,7 @@ from pydantic_settings import BaseSettings
 
 class Settings(BaseSettings):
     # API settings
-    PROJECT_NAME: str = "Millionaires on Wheels API"
+    PROJECT_NAME: str = "Who Wants To be A Scholarnnaire API"
     ALLOWED_ORIGINS: str = "*"
 
     # Email Settings

@@ -34,8 +34,10 @@ class Question(Base):
     
     # New fields for tournament association
     tournament_track_id = Column(Integer, ForeignKey("tournament_tracks.id"), nullable=True)
+    game_division_id = Column(Integer, ForeignKey("game_divisions.id"), nullable=True)
     question_mode = Column(String(50), nullable=True)
     question_type = Column(String(50), nullable=True)
     stage = Column(String(50), default="Group Stage 1", index=True, nullable=True)
     
     tournament_track = relationship("TournamentTrack")
+

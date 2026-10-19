@@ -36,9 +36,10 @@ def seed():
     try:
         # ── 2. SEED TOURNAMENT TRACKS ──
         tracks_data = [
-            {"id": 1, "name": "Main Scholarnnaire Quiz", "description": "National Championship Scholastic Quiz Track", "entry_fee": "N10,000"},
-            {"id": 2, "name": "Spell Quest Bee", "description": "National Orthography & Spelling Bee Competition", "entry_fee": "N5,000"},
-            {"id": 3, "name": "Sport Mode", "description": "Sports, Trivia & General Physical Intelligence Track", "entry_fee": "N5,000"},
+            {"id": 1, "name": "SCHOLARNNAIRE GENERAL", "description": "The standard 11-stage quiz tournament with lifelines and knowledge ladder.", "entry_fee": "N50,000"},
+            {"id": 2, "name": "SCHOLARNNAIRE SPELL QUEST", "description": "The high-stakes spelling bee, vocabulary and word master tournament.", "entry_fee": "N30,000"},
+            {"id": 3, "name": "SCHOLARNNAIRE BIBLE WORD CHALLENGE", "description": "Scriptural knowledge, Bible verses and sacred word mastery tournament.", "entry_fee": "Free"},
+            {"id": 4, "name": "SCHOLARNNAIRE SPORTS GAME SHOW", "description": "Sports trivia, athletics, football, and arena predictions tournament.", "entry_fee": "N20,000"},
         ]
         created_tracks = []
         for t_info in tracks_data:
@@ -58,8 +59,8 @@ def seed():
             else:
                 created_tracks.append(existing)
 
-        main_track = db.query(TournamentTrack).filter(TournamentTrack.name == "Main Scholarnnaire Quiz").first()
-        spell_track = db.query(TournamentTrack).filter(TournamentTrack.name == "Spell Quest Bee").first()
+        main_track = db.query(TournamentTrack).filter(TournamentTrack.name == "SCHOLARNNAIRE GENERAL").first()
+        spell_track = db.query(TournamentTrack).filter(TournamentTrack.name == "SCHOLARNNAIRE SPELL QUEST").first()
 
         # ── 3. SEED TOURNAMENT & STAGE ──
         tournament = db.query(Tournament).filter(Tournament.name == "Scholarnnaire National Championship 2026").first()
@@ -102,7 +103,7 @@ def seed():
                 access_code=None,
                 is_approved=True,
                 entry_fee_paid=True,
-                tournament_track="Main Scholarnnaire Quiz"
+                tournament_track="SCHOLARNNAIRE GENERAL"
             )
             db.add(school)
             db.flush()

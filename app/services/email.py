@@ -30,18 +30,18 @@ class EmailService:
     def send_verification_email(self, to_email: str, access_code: str, school_name: str):
         """Step 1 Email: Sent immediately upon registration to verify the school's email address."""
         message = MIMEMultipart("alternative")
-        message["Subject"] = f"Verify Your School Email: {access_code} - Millionaires on Wheels"
-        message["From"] = f"Millionaires on Wheels <{self.sender_email}>"
+        message["Subject"] = f"Verify Your School Email: {access_code} - Who Wants To be A Scholarnnaire"
+        message["From"] = f"Who Wants To be A Scholarnnaire <{self.sender_email}>"
         message["To"] = to_email
 
         text = (
             f"Hello {school_name},\n\n"
-            f"Thank you for registering your school for the Millionaires on Wheels National Academic Championship.\n\n"
+            f"Thank you for registering your school for the Who Wants To be A Scholarnnaire National Academic Championship.\n\n"
             f"Your 6-Digit Email Verification Code is: {access_code}\n\n"
             f"Enter this code on the registration verification screen to activate your account.\n\n"
             f"If you did not initiate this registration, please disregard this email.\n\n"
             f"Best regards,\n"
-            f"Millionaires on Wheels Championship Committee\n"
+            f"Who Wants To be A Scholarnnaire Championship Committee\n"
             f"https://scholarnnaire.com"
         )
 
@@ -70,7 +70,7 @@ class EmailService:
             <div class="content">
               <p style="font-size: 16px; line-height: 1.6; margin-top: 0;">Hello <strong>{school_name}</strong>,</p>
               <p style="font-size: 15px; line-height: 1.6; color: #475569;">
-                Thank you for enrolling your institution in the <strong>Millionaires on Wheels</strong> National High School Academic Championship.
+                Thank you for enrolling your institution in the <strong>Who Wants To be A Scholarnnaire</strong> National High School Academic Championship.
               </p>
               <p style="font-size: 15px; line-height: 1.6; color: #475569;">
                 Please enter the 6-digit verification code below on the screen to confirm your official institutional email address:
@@ -86,7 +86,7 @@ class EmailService:
               </p>
             </div>
             <div class="footer">
-              <p style="margin: 0 0 6px 0;">Millionaires on Wheels • Scholarnaire Academic Championship</p>
+              <p style="margin: 0 0 6px 0;">Who Wants To be A Scholarnnaire Academic Championship</p>
               <p style="margin: 0;"><a href="https://scholarnnaire.com" style="color: #059669; text-decoration: none;">https://scholarnnaire.com</a></p>
             </div>
           </div>
@@ -108,14 +108,14 @@ class EmailService:
         """Step 2 Email: Sent immediately after email verification completes, with portal login credentials and administration instructions."""
         message = MIMEMultipart("alternative")
         message["Subject"] = f"Account Verified: School Administration Credentials & Guide - {school_name}"
-        message["From"] = f"Millionaires on Wheels <{self.sender_email}>"
+        message["From"] = f"Who Wants To be A Scholarnnaire <{self.sender_email}>"
         message["To"] = to_email
 
         login_url = "https://scholarnnaire.com/login?tab=school"
 
         text = (
             f"Congratulations {school_name}!\n\n"
-            f"Your institutional registration for the Millionaires on Wheels National Academic Championship has been successfully verified.\n\n"
+            f"Your institutional registration for the Who Wants To be A Scholarnnaire National Academic Championship has been successfully verified.\n\n"
             f"Your School Administration Credentials:\n"
             f"- Portal Login URL: {login_url}\n"
             f"- Admin Username: {admin_username}\n"
@@ -128,7 +128,7 @@ class EmailService:
             f"4. View Tournament Tracks & Match Schedules: Access fixture dates, rules, syllabus coverage, and leaderboard standings.\n\n"
             f"Need assistance? Contact our Tournament Coordination Team at info@scholarnnaire.com.\n\n"
             f"Best regards,\n"
-            f"Millionaires on Wheels Academic Championship\n"
+            f"Who Wants To be A Scholarnnaire Academic Championship\n"
             f"https://scholarnnaire.com"
         )
 
@@ -164,7 +164,7 @@ class EmailService:
             <div class="content">
               <p style="font-size: 16px; line-height: 1.6; margin-top: 0;">Congratulations <strong>{school_name}</strong>,</p>
               <p style="font-size: 15px; line-height: 1.6; color: #475569;">
-                Your institutional email address has been successfully verified! Your official School Administration account is now fully active for the <strong>Millionaires on Wheels</strong> Tournament.
+                Your institutional email address has been successfully verified! Your official School Administration account is now fully active for the <strong>Who Wants To be A Scholarnnaire</strong> Tournament.
               </p>
 
               <div class="creds-card">
@@ -210,7 +210,7 @@ class EmailService:
               </div>
             </div>
             <div class="footer">
-              <p style="margin: 0 0 6px 0;">Millionaires on Wheels • Scholarnaire Academic Championship</p>
+              <p style="margin: 0 0 6px 0;">Who Wants To be A Scholarnnaire Academic Championship</p>
               <p style="margin: 0;"><a href="https://scholarnnaire.com" style="color: #059669; text-decoration: none;">https://scholarnnaire.com</a></p>
             </div>
           </div>
@@ -231,7 +231,7 @@ class EmailService:
 
         message = MIMEMultipart("alternative")
         message["Subject"] = subject
-        message["From"] = f"Millionaires on Wheels <{self.sender_email}>"
+        message["From"] = f"Who Wants To be A Scholarnnaire <{self.sender_email}>"
         message["To"] = to_email
 
         html = body
